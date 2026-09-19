@@ -547,11 +547,17 @@ function buildSlotOptions(draft, dayIdx, group, slotIndex, data) {
   const members = data[group].members;
   const usedElsewhereThisDay = new Set(day[group].filter((n, idx) => idx !== slotIndex));
   const excluded = getWeekendExcluded(draft, dayIdx, group, data);
-  return members
+  const options = members
     .filter((m) => isEligible(m, date))
     .filter((m) => !usedElsewhereThisDay.has(m.name))
     .filter((m) => !excluded.has(m.name))
     .map((m) => m.name);
+  // 차은미(스케줄근무자)는 로테이션 명단에 없어서 위 목록엔 안 잡히지만,
+  // 본인이 못 나오는 날 다른 사람으로 바꿀 수 있게 현장 슬롯엔 항상 후보로 넣어준다.
+  if (group === 'field' && !usedElsewhereThisDay.has(SCHEDULE_WORKER.name)) {
+    options.unshift(SCHEDULE_WORKER.name);
+  }
+  return options;
 }
 
 function renderSlotSelect(draft, dayIdx, group, slotIndex, data) {
@@ -599,9 +605,7 @@ function renderSchedule(draft, data) {
       html += `<td>${renderSlotSelect(draft, dayIdx, 'managers', 0, data)}</td>`;
       html += `<td>${renderSlotSelect(draft, dayIdx, 'forklift', 0, data)}</td>`;
       for (let i = 0; i < fieldCols; i++) {
-        if (i === 0) {
-          html += `<td><span class="slot-fixed">${escapeHtml(SCHEDULE_WORKER.name)}</span></td>`;
-        } else if (i < day.field.length || i < (day.dow === 'sat' ? data.field.requiredSat : data.field.requiredSun)) {
+        if (i < day.field.length || i < (day.dow === 'sat' ? data.field.requiredSat : data.field.requiredSun)) {
           html += `<td>${renderSlotSelect(draft, dayIdx, 'field', i, data)}</td>`;
         } else {
           html += '<td>—</td>';
