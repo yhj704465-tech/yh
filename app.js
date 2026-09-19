@@ -7,7 +7,9 @@
  * csv.* : 각 시트를 "파일 > 공유 > 웹에 게시"로 CSV 게시한 URL
  *   - managers : 이름 | 급여형태 | 입사일 | 누적횟수 | 최근근무일 | 제외요일
  *   - forklift : 이름 | 급여형태 | 입사일 | 누적횟수 | 최근근무일 | 제외요일
- *   - field    : 이름 | 소속 | FB | 입사일 | 누적횟수 | 최근근무일 | 제외요일   (FB 컬럼: TRUE/FALSE)
+ *   - field    : 이름 | 소속 | FB | 입사일 | 누적횟수 | 최근근무일 | 제외요일 | 고정근무
+ *              (FB, 고정근무 컬럼: TRUE/FALSE. 고정근무=TRUE인 사람은 매주 토·일 자동 근무
+ *               처리되고 로테이션 카운트에서 빠진다 — 차은미 같은 스케줄근무자용. 없으면 전부 FALSE)
  *   ※ 제외요일 : "일요일" / "토요일" 처럼 그 사람을 절대 배정하면 안 되는 요일. 없으면 빈칸.
  *              여러 개면 "토요일,일요일"처럼 쉼표로 구분.
  *   - tieBreakHistory : 그룹 | 이름
@@ -37,11 +39,19 @@ function isConfigured() {
     CONFIG.appsScriptUrl.startsWith('http');
 }
 
-/* 스케줄근무자: 로테이션 대상 아님, 매주 토~수 자동 근무 (목·금 고정휴무) */
-const SCHEDULE_WORKER = {
-  name: '차은미(고은)',
-  pattern: '매주 토요일~수요일 근무 / 목·금 고정휴무',
-};
+/**
+ * 고정근무자(구 SCHEDULE_WORKER) — 이름을 코드에 박아두지 않고, Field 시트의
+ * "고정근무" 컬럼(TRUE/FALSE)으로 관리한다. 사람이 바뀌거나 없어져도 시트만
+ * 고치면 되고, 코드 재배포가 필요 없다. 매주 토~수 자동 근무 패턴을 가정하고
+ * 로테이션 카운트 대상에서는 제외하되, 그 사람의 FB 여부는 그대로 존중한다.
+ */
+function getScheduleWorkers(members) {
+  return members.filter((m) => m.scheduleWorker);
+}
+
+function getScheduleWorkerNameSet(members) {
+  return new Set(getScheduleWorkers(members).map((m) => m.name));
+}
 
 /* ============================================================
  * MOCK DATA — Google Sheets 연동 전 화면/알고리즘 검증용 초기 데이터.
@@ -104,6 +114,7 @@ const MOCK_DATA = {
       { name: '채희정', fb: true, count: 1, lastWorked: '2026-09-27' },
       { name: '윤민경', fb: false, count: 1, lastWorked: '2026-09-27' },
       { name: '이소연', fb: false, count: 1, lastWorked: '2026-09-27' },
+      { name: '차은미(고은)', fb: false, count: 0, lastWorked: '', scheduleWorker: true },
     ],
   },
   tieBreakHistory: { managers: [], forklift: [], field: [] },
@@ -240,7 +251,12 @@ function parseRosterRow(row) {
 function parseFieldRow(row) {
   const base = parseRosterRow(row);
   const fbRaw = String(row['FB'] || '').trim().toUpperCase();
-  return { ...base, fb: fbRaw === 'TRUE' || fbRaw === '1' || fbRaw === 'Y' };
+  const swRaw = String(row['고정근무'] || '').trim().toUpperCase();
+  return {
+    ...base,
+    fb: fbRaw === 'TRUE' || fbRaw === '1' || fbRaw === 'Y',
+    scheduleWorker: swRaw === 'TRUE' || swRaw === '1' || swRaw === 'Y',
+  };
 }
 
 function mapGroupLabelToKey(v) {
@@ -390,13 +406,15 @@ function assignSingleSlot(members, date, excludeNames, owedSet) {
 }
 
 function assignFieldDay(members, minFbPerDay, date, requiredTotal, excludeNames, owedSet) {
-  const rotationNeeded = Math.max(0, requiredTotal - 1); // 차은미 고정 1명 제외
+  const scheduleWorkers = getScheduleWorkers(members); // 고정근무자는 로테이션 대상 아님, 매일 자동 포함
+  const rotationPool = members.filter((m) => !m.scheduleWorker);
+  const rotationNeeded = Math.max(0, requiredTotal - scheduleWorkers.length);
   const eligible = (m) => isEligible(m, date) && !excludeNames.has(m.name);
-  const ranked = rankCandidates(members, eligible, owedSet);
+  const ranked = rankCandidates(rotationPool, eligible, owedSet);
   let { selected, owedSet: newOwed, shortfall } = selectTopWithTieBreak(ranked, rotationNeeded, owedSet);
 
   const warnings = [];
-  const fbCount = selected.filter((m) => m.fb).length;
+  const fbCount = scheduleWorkers.filter((m) => m.fb).length + selected.filter((m) => m.fb).length;
   if (fbCount < minFbPerDay && rotationNeeded > 0) {
     const selectedNames = new Set(selected.map((m) => m.name));
     const bestFbOutside = ranked.find((m) => m.fb && !selectedNames.has(m.name));
@@ -415,7 +433,11 @@ function assignFieldDay(members, minFbPerDay, date, requiredTotal, excludeNames,
 
   if (shortfall) warnings.push(`현장 인원 부족 (${shortfall}명 미배정)`);
 
-  return { picked: [SCHEDULE_WORKER.name, ...selected.map((m) => m.name)], owedSet: newOwed, warnings };
+  return {
+    picked: [...scheduleWorkers.map((m) => m.name), ...selected.map((m) => m.name)],
+    owedSet: newOwed,
+    warnings,
+  };
 }
 
 function cloneMembers(members) {
@@ -423,8 +445,9 @@ function cloneMembers(members) {
 }
 
 function bumpWorkingMembers(members, names, iso) {
-  const nameSet = new Set(names.filter((n) => n !== SCHEDULE_WORKER.name));
+  const nameSet = new Set(names);
   members.forEach((m) => {
+    if (m.scheduleWorker) return; // 고정근무자는 로테이션 카운트 대상 아님
     if (nameSet.has(m.name)) {
       m.count += 1;
       if (!m.lastWorked || iso > m.lastWorked) m.lastWorked = iso;
@@ -579,17 +602,13 @@ function buildSlotOptions(draft, dayIdx, group, slotIndex, data) {
   const members = data[group].members;
   const usedElsewhereThisDay = new Set(day[group].filter((n, idx) => idx !== slotIndex));
   const excluded = getWeekendExcluded(draft, dayIdx, group, data);
-  const options = members
+  // 고정근무자는 매주 토·일 전부 근무하는 게 정상이라, "전날 근무해서 오늘 제외"
+  // 규칙(규칙9)의 대상이 아니다 — 로테이션 인원에게만 적용한다.
+  return members
     .filter((m) => isEligible(m, date))
     .filter((m) => !usedElsewhereThisDay.has(m.name))
-    .filter((m) => !excluded.has(m.name))
+    .filter((m) => m.scheduleWorker || !excluded.has(m.name))
     .map((m) => m.name);
-  // 차은미(스케줄근무자)는 로테이션 명단에 없어서 위 목록엔 안 잡히지만,
-  // 본인이 못 나오는 날 다른 사람으로 바꿀 수 있게 현장 슬롯엔 항상 후보로 넣어준다.
-  if (group === 'field' && !usedElsewhereThisDay.has(SCHEDULE_WORKER.name)) {
-    options.unshift(SCHEDULE_WORKER.name);
-  }
-  return options;
 }
 
 function renderSlotSelect(draft, dayIdx, group, slotIndex, data) {
@@ -673,15 +692,20 @@ function onSlotChange(evt) {
 
 function renderRosterStatus(data) {
   const container = document.getElementById('rosterContainer');
+  const fieldScheduleWorkerNames = getScheduleWorkers(data.field.members).map((m) => m.name);
+  const fieldTitle = fieldScheduleWorkerNames.length
+    ? `${data.field.label} (+ ${fieldScheduleWorkerNames.join(', ')} 고정)`
+    : data.field.label;
   const groups = [
     { key: 'managers', title: data.managers.label },
     { key: 'forklift', title: data.forklift.label },
-    { key: 'field', title: `${data.field.label} (+ ${SCHEDULE_WORKER.name} 고정)` },
+    { key: 'field', title: fieldTitle },
   ];
 
   container.innerHTML = groups
     .map((g) => {
       const members = data[g.key].members
+        .filter((m) => !m.scheduleWorker)
         .slice()
         .sort((a, b) => a.count - b.count || (a.lastWorked || '').localeCompare(b.lastWorked || ''));
       const rows = members
@@ -719,6 +743,7 @@ function bumpDelta(map, name, iso) {
 function buildCommitPayload(draft, data) {
   const deltas = { managers: new Map(), forklift: new Map(), field: new Map() };
   const scheduleLogRows = [];
+  const fieldScheduleWorkerNames = getScheduleWorkerNameSet(data.field.members);
 
   draft.days.forEach((day) => {
     if (day.isHoliday) return;
@@ -733,7 +758,7 @@ function buildCommitPayload(draft, data) {
       scheduleLogRows.push({ date: day.date, weekday, group: data.forklift.label, name });
     });
     day.field
-      .filter((name) => name && name !== SCHEDULE_WORKER.name)
+      .filter((name) => name && !fieldScheduleWorkerNames.has(name))
       .forEach((name) => {
         bumpDelta(deltas.field, name, day.date);
         scheduleLogRows.push({ date: day.date, weekday, group: data.field.label, name });
@@ -872,16 +897,17 @@ async function onExport() {
  * 그대로 쓰기 때문에, 폰트를 파일에 통째로 내장해야 하는
  * jsPDF류보다 훨씬 가볍고 깨질 일이 없다.
  * ============================================================ */
-function buildHandoutRows(draft) {
+function buildHandoutRows(draft, data) {
   const forkliftRows = [];
   const fieldRows = [];
+  const fieldScheduleWorkerNames = getScheduleWorkerNameSet(data.field.members);
   draft.days.forEach((day) => {
     if (day.isHoliday) return;
     const weekdayLabel = day.dow === 'sat' ? '토' : '일';
     const dateLabel = `${formatKoreanDate(day.date)}(${weekdayLabel})`;
     if (day.forklift[0]) forkliftRows.push({ date: dateLabel, name: day.forklift[0] });
     day.field.forEach((name) => {
-      if (name && name !== SCHEDULE_WORKER.name) fieldRows.push({ date: dateLabel, name });
+      if (name && !fieldScheduleWorkerNames.has(name)) fieldRows.push({ date: dateLabel, name });
     });
   });
   return { forkliftRows, fieldRows };
@@ -997,7 +1023,7 @@ function onHandoutDownload() {
   const year = Number(yearSelectEl.value);
   const month = Number(monthSelectEl.value);
 
-  const { forkliftRows, fieldRows } = buildHandoutRows(currentDraft);
+  const { forkliftRows, fieldRows } = buildHandoutRows(currentDraft, DATA);
   const draftByDate = new Map(currentDraft.days.map((d) => [d.date, d]));
   const weeks = buildCalendarWeeks(year, month, draftByDate, DATA);
   const html = buildHandoutHtml(year, month, forkliftRows, fieldRows, weeks);
