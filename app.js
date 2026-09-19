@@ -877,12 +877,20 @@ function buildCalendarWeeks(year, month, draftByDate, data) {
   return weeks;
 }
 
+function buildAssignColumnHtml(rows) {
+  if (!rows.length) return '<table class="assign-table"><thead><tr><th style="width:110px;">날짜</th><th>이름</th><th class="blank-cell">대체휴무일</th></tr></thead><tbody><tr><td colspan="3">배정 내역이 없습니다.</td></tr></tbody></table>';
+  const rowsHtml = rows.map((r) => `<tr><td>${escapeHtml(r.date)}</td><td>${escapeHtml(r.name)}</td><td class="blank-cell"></td></tr>`).join('');
+  return `<table class="assign-table"><thead><tr><th style="width:110px;">날짜</th><th>이름</th><th class="blank-cell">대체휴무일</th></tr></thead><tbody>${rowsHtml}</tbody></table>`;
+}
+
 function buildHandoutHtml(year, month, rows, weeks) {
   const weekDayNames = ['일', '월', '화', '수', '목', '금', '토'];
 
-  const rowsHtml = rows.length
-    ? rows.map((r) => `<tr><td>${escapeHtml(r.date)}</td><td>${escapeHtml(r.name)}</td><td class="blank-cell"></td></tr>`).join('')
-    : '<tr><td colspan="3">배정 내역이 없습니다.</td></tr>';
+  // 근무 목록이 길어도 한 페이지에 들어가도록 좌우 2단으로 나눠서 배치한다.
+  const half = Math.ceil(rows.length / 2);
+  const colA = rows.slice(0, half);
+  const colB = rows.slice(half);
+  const assignColumnsHtml = `<div class="assign-columns">${buildAssignColumnHtml(colA)}${buildAssignColumnHtml(colB)}</div>`;
 
   const calendarHtml = weeks
     .map((week) => `<tr>${week
@@ -909,14 +917,15 @@ function buildHandoutHtml(year, month, rows, weeks) {
   body { font-family: "Pretendard", "Malgun Gothic", "맑은 고딕", sans-serif; color: #111; margin: 0; }
   h1 { font-size: 17px; margin: 0 0 4px; }
   .sub { font-size: 11px; color: #555; margin: 0 0 14px; }
-  h2.section-title { font-size: 13px; margin: 16px 0 6px; border-left: 4px solid #4472C4; padding-left: 8px; }
-  h2.calendar-title { page-break-before: always; break-before: page; margin-top: 0; padding-top: 0; }
-  table.assign-table { width: 100%; border-collapse: collapse; font-size: 11px; }
-  table.assign-table th, table.assign-table td { border: 1px solid #999; padding: 5px 8px; text-align: left; }
+  h2.section-title { font-size: 13px; margin: 14px 0 6px; border-left: 4px solid #4472C4; padding-left: 8px; }
+  .assign-columns { display: flex; gap: 10px; }
+  .assign-columns > table { flex: 1; min-width: 0; }
+  table.assign-table { width: 100%; border-collapse: collapse; font-size: 9.5px; }
+  table.assign-table th, table.assign-table td { border: 1px solid #999; padding: 3px 5px; text-align: left; }
   table.assign-table th { background: #ececec; }
   table.assign-table thead { display: table-header-group; }
   table.assign-table tr { page-break-inside: avoid; break-inside: avoid; }
-  .blank-cell { min-width: 100px; }
+  .blank-cell { min-width: 70px; }
   table.calendar { width: 100%; border-collapse: collapse; table-layout: fixed; page-break-inside: avoid; break-inside: avoid; }
   table.calendar thead { display: table-header-group; }
   table.calendar tr { page-break-inside: avoid; break-inside: avoid; }
@@ -933,12 +942,9 @@ function buildHandoutHtml(year, month, rows, weeks) {
   <p class="sub">${year}년 ${month}월 · 지게차 / 현장 근무자용 — 근무하신 날짜의 대체휴무일을 직접 적어 제출해주세요.</p>
 
   <h2 class="section-title">근무 확인 및 대체휴무일 기재</h2>
-  <table class="assign-table">
-    <thead><tr><th style="width:130px;">날짜</th><th>이름</th><th class="blank-cell">대체휴무일 (직접 기입)</th></tr></thead>
-    <tbody>${rowsHtml}</tbody>
-  </table>
+  ${assignColumnsHtml}
 
-  <h2 class="section-title calendar-title">${month}월 달력</h2>
+  <h2 class="section-title">${month}월 달력</h2>
   <table class="calendar">
     <thead><tr>${weekDayNames.map((w) => `<th>${w}</th>`).join('')}</tr></thead>
     <tbody>${calendarHtml}</tbody>
