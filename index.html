@@ -4,9 +4,21 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>풀필먼트2팀 주말 근무표</title>
+<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+<link rel="stylesheet" as="style" crossorigin href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.css">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
+<div id="loginGate" class="login-gate">
+  <form id="loginForm" class="login-box">
+    <h2>풀필먼트2팀 근무표</h2>
+    <label>아이디<input type="text" id="loginId" autocomplete="username" required></label>
+    <label>비밀번호<input type="password" id="loginPw" autocomplete="current-password" required></label>
+    <p id="loginError" class="login-error"></p>
+    <button type="submit" class="btn btn-primary">로그인</button>
+  </form>
+</div>
+
 <header class="app-header">
   <h1>풀필먼트2팀 주말 근무표</h1>
   <p class="app-sub">관리자 / 지게차 / 현장 자동 배정 · 누적 근무 횟수 기준</p>
@@ -50,7 +62,7 @@
 </main>
 
 <footer class="app-footer">
-  <p>사내 전용 도구 · 로그인 없음 · 데이터 저장소: Google Sheets</p>
+  <p>사내 전용 도구 · 데이터 저장소: Google Sheets</p>
 </footer>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
