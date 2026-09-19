@@ -910,13 +910,18 @@ function buildHandoutHtml(year, month, rows, weeks) {
   h1 { font-size: 18px; margin: 0 0 4px; }
   .sub { font-size: 12px; color: #555; margin: 0 0 18px; }
   h2.section-title { font-size: 14px; margin: 22px 0 8px; border-left: 4px solid #4472C4; padding-left: 8px; }
+  h2.calendar-title { page-break-before: always; break-before: page; margin-top: 0; padding-top: 4px; }
   table.assign-table { width: 100%; border-collapse: collapse; font-size: 12px; }
   table.assign-table th, table.assign-table td { border: 1px solid #999; padding: 7px 9px; text-align: left; }
   table.assign-table th { background: #ececec; }
+  table.assign-table thead { display: table-header-group; }
+  table.assign-table tr { page-break-inside: avoid; break-inside: avoid; }
   .blank-cell { min-width: 110px; }
-  table.calendar { width: 100%; border-collapse: collapse; table-layout: fixed; }
+  table.calendar { width: 100%; border-collapse: collapse; table-layout: fixed; page-break-inside: avoid; break-inside: avoid; }
+  table.calendar thead { display: table-header-group; }
+  table.calendar tr { page-break-inside: avoid; break-inside: avoid; }
   table.calendar th { background: #ececec; padding: 6px; font-size: 12px; border: 1px solid #999; text-align: center; }
-  table.calendar td { border: 1px solid #999; vertical-align: top; height: 92px; padding: 5px; font-size: 10.5px; }
+  table.calendar td { border: 1px solid #999; vertical-align: top; height: 92px; padding: 5px; font-size: 10.5px; page-break-inside: avoid; break-inside: avoid; }
   .cal-date { font-weight: 700; font-size: 11px; }
   .cal-holiday { color: #4472C4; }
   .cal-names { margin-top: 4px; line-height: 1.5; }
@@ -933,7 +938,7 @@ function buildHandoutHtml(year, month, rows, weeks) {
     <tbody>${rowsHtml}</tbody>
   </table>
 
-  <h2 class="section-title">${month}월 달력</h2>
+  <h2 class="section-title calendar-title">${month}월 달력</h2>
   <table class="calendar">
     <thead><tr>${weekDayNames.map((w) => `<th>${w}</th>`).join('')}</tr></thead>
     <tbody>${calendarHtml}</tbody>
