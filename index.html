@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>풀필먼트2팀 주말 근무표</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="app-header">
+  <h1>풀필먼트2팀 주말 근무표</h1>
+  <p class="app-sub">관리자 / 지게차 / 현장 자동 배정 · 누적 근무 횟수 기준</p>
+</header>
+
+<div id="configBanner" class="banner banner-warn" hidden>
+  Google Sheets 연동이 아직 설정되지 않아 <strong>예시(mock) 데이터</strong>로 동작 중입니다.
+  app.js 상단 CONFIG 값을 채우면 실제 시트 데이터로 전환됩니다.
+</div>
+
+<main>
+  <section class="panel controls">
+    <div class="control-group">
+      <label for="yearSelect">연도</label>
+      <select id="yearSelect"></select>
+      <label for="monthSelect">월</label>
+      <select id="monthSelect"></select>
+    </div>
+    <div class="control-group control-actions">
+      <button id="btnReload" class="btn btn-ghost" type="button">데이터 새로고침</button>
+      <button id="btnGenerate" class="btn btn-primary" type="button">자동배정 생성</button>
+      <button id="btnCommit" class="btn btn-confirm" type="button" disabled>확정 저장</button>
+      <button id="btnExport" class="btn btn-ghost" type="button" disabled>엑셀 다운로드</button>
+    </div>
+  </section>
+
+  <p id="statusLine" class="status-line" role="status" aria-live="polite"></p>
+
+  <section class="panel">
+    <h2>배정표 미리보기</h2>
+    <p class="hint">각 슬롯을 클릭하면 같은 그룹의 다른 배정 가능 인원으로 바꿀 수 있습니다. 수정은 저장 전 화면에만 반영되며, 이후 날짜의 자동배정에는 영향을 주지 않습니다.</p>
+    <div id="scheduleContainer" class="schedule-container">
+      <p class="empty-hint">연도/월을 선택하고 "자동배정 생성"을 눌러주세요.</p>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>현재 누적 현황</h2>
+    <div id="rosterContainer" class="roster-grid"></div>
+  </section>
+</main>
+
+<footer class="app-footer">
+  <p>사내 전용 도구 · 로그인 없음 · 데이터 저장소: Google Sheets</p>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

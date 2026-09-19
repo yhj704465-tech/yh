@@ -1,0 +1,188 @@
+:root {
+  --gray-header: #ECECEC;
+  --gray-tab: #DBDBDB;
+  --blue-holiday: #4472C4;
+  --border: #d5d5d5;
+  --text: #222;
+  --text-muted: #666;
+  --accent: #2f6fed;
+  --danger: #c0392b;
+  --radius: 6px;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: "Malgun Gothic", "맑은 고딕", -apple-system, sans-serif;
+  color: var(--text);
+  background: #fafafa;
+}
+
+.app-header {
+  padding: 20px 24px 12px;
+  border-bottom: 3px solid var(--gray-tab);
+  background: #fff;
+}
+.app-header h1 { margin: 0 0 4px; font-size: 1.4rem; }
+.app-sub { margin: 0; color: var(--text-muted); font-size: 0.9rem; }
+
+.banner {
+  margin: 12px 24px 0;
+  padding: 10px 14px;
+  border-radius: var(--radius);
+  font-size: 0.9rem;
+}
+.banner-warn {
+  background: #fff6e0;
+  border: 1px solid #e8c766;
+  color: #6b5200;
+}
+
+main { padding: 16px 24px 40px; max-width: 1100px; margin: 0 auto; }
+
+.panel {
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+  margin-bottom: 18px;
+}
+.panel h2 { margin: 0 0 10px; font-size: 1.05rem; }
+.hint { color: var(--text-muted); font-size: 0.85rem; margin: 0 0 12px; }
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.control-group { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.control-group label { font-size: 0.85rem; color: var(--text-muted); }
+select {
+  font-family: inherit;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: #fff;
+}
+
+.btn {
+  font-family: inherit;
+  font-size: 0.9rem;
+  padding: 8px 14px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: #fff;
+  cursor: pointer;
+}
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn-ghost:hover:not(:disabled) { background: var(--gray-header); }
+.btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn-primary:hover:not(:disabled) { background: #2559c4; }
+.btn-confirm { background: #2f9e5b; border-color: #2f9e5b; color: #fff; }
+.btn-confirm:hover:not(:disabled) { background: #26824a; }
+
+.status-line {
+  margin: 0 0 4px;
+  min-height: 1.2em;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  padding: 0 2px;
+}
+.status-line.error { color: var(--danger); }
+.status-line.success { color: #2f9e5b; }
+
+.empty-hint { color: var(--text-muted); font-size: 0.9rem; }
+
+/* 배정표 */
+.schedule-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+.schedule-table th, .schedule-table td {
+  border: 1px solid var(--border);
+  padding: 8px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+.schedule-table thead th {
+  background: var(--gray-header);
+  font-weight: 600;
+}
+.schedule-table tr.is-holiday td { background: #eef2fb; }
+.schedule-table .date-cell { white-space: nowrap; }
+.schedule-table .date-cell.holiday-text {
+  color: var(--blue-holiday);
+  font-weight: 700;
+}
+.slot-select {
+  width: 100%;
+  min-width: 110px;
+  font-family: inherit;
+  font-size: 0.85rem;
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.slot-fixed {
+  display: inline-block;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: #eef2fb;
+  color: var(--accent);
+  font-size: 0.8rem;
+}
+.fb-tag {
+  display: inline-block;
+  margin-left: 4px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: #e6f4ea;
+  color: #206b3a;
+  font-size: 0.72rem;
+  vertical-align: middle;
+}
+.warn-tag {
+  display: inline-block;
+  margin-top: 4px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: #fdecea;
+  color: var(--danger);
+  font-size: 0.75rem;
+}
+.holiday-row-label {
+  color: var(--blue-holiday);
+  font-weight: 700;
+}
+
+/* 누적 현황 */
+.roster-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 16px;
+}
+.roster-card h3 {
+  margin: 0 0 8px;
+  font-size: 0.95rem;
+  padding-bottom: 6px;
+  border-bottom: 2px solid var(--gray-tab);
+}
+.roster-table { width: 100%; border-collapse: collapse; font-size: 0.83rem; }
+.roster-table th, .roster-table td {
+  border-bottom: 1px solid #eee;
+  padding: 5px 6px;
+  text-align: left;
+}
+.roster-table thead th { background: var(--gray-header); }
+.roster-table td.num { text-align: right; }
+
+.app-footer {
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  padding: 16px;
+}
