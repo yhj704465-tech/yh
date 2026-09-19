@@ -867,6 +867,19 @@ yearSelectEl.addEventListener('change', resetDraftUi);
 monthSelectEl.addEventListener('change', resetDraftUi);
 
 /* ============================================================
+ * 다크모드 — index.html의 인라인 스크립트가 최초 페인트 전에
+ * data-theme을 이미 설정해두므로, 여기서는 토글 클릭만 처리한다.
+ * ============================================================ */
+const THEME_STORAGE_KEY = 'ff2_theme';
+
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const current = document.documentElement.getAttribute('data-theme');
+  const next = current === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem(THEME_STORAGE_KEY, next);
+});
+
+/* ============================================================
  * 로그인 게이트 — 서버가 없는 정적 사이트라 실제 보안은 아니고,
  * 아무나 못 들어오게 막는 간단한 화면 가림막입니다.
  * ============================================================ */

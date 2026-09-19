@@ -29,6 +29,9 @@
   --gray-header: #ececec;
   --gray-tab: #dbdbdb;
   --holiday-blue: #4472c4;
+  --holiday-row-bg: #eef2fb;
+  --holiday-row-bg-hover: #e6ecfa;
+  --login-gradient-start: #eef1ff;
 
   --radius-sm: 8px;
   --radius-md: 12px;
@@ -40,6 +43,45 @@
   --font: "Pretendard", "Malgun Gothic", "맑은 고딕", -apple-system, BlinkMacSystemFont, sans-serif;
 }
 
+:root[data-theme="dark"] {
+  --bg: #14161c;
+  --surface: #1c1f27;
+  --surface-alt: #242833;
+  --border: #2d323c;
+  --border-strong: #3a4049;
+  --text: #e7e9ec;
+  --text-muted: #9aa1ae;
+  --text-faint: #6b7280;
+
+  --accent: #6366f1;
+  --accent-hover: #818cf8;
+  --accent-soft: #262a45;
+  --accent-soft-text: #a5b4fc;
+
+  --success: #22c55e;
+  --success-hover: #4ade80;
+  --success-soft: #14301f;
+  --success-text: #4ade80;
+
+  --danger: #f87171;
+  --danger-soft: #3a1f1f;
+  --danger-text: #fca5a5;
+
+  --warning-soft: #3a2f10;
+  --warning-border: #6b5518;
+  --warning-text: #f0d78a;
+
+  --gray-header: #262b35;
+  --gray-tab: #3a4049;
+  --holiday-blue: #85a8ea;
+  --holiday-row-bg: #1c2334;
+  --holiday-row-bg-hover: #222b40;
+  --login-gradient-start: #1c2340;
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.45), 0 1px 2px rgba(0, 0, 0, 0.3);
+}
+
 * { box-sizing: border-box; }
 
 body {
@@ -48,13 +90,14 @@ body {
   color: var(--text);
   background: var(--bg);
   -webkit-font-smoothing: antialiased;
+  transition: background-color 0.2s ease, color 0.2s ease;
 }
 
 /* ---------- 로그인 게이트 ---------- */
 .login-gate {
   position: fixed;
   inset: 0;
-  background: linear-gradient(160deg, #eef1ff 0%, var(--bg) 45%);
+  background: linear-gradient(160deg, var(--login-gradient-start) 0%, var(--bg) 45%);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -108,6 +151,12 @@ body {
   border-bottom: 1px solid var(--border);
   box-shadow: var(--shadow-sm);
 }
+.app-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
 .app-header h1 {
   margin: 0 0 3px;
   font-size: 1.3rem;
@@ -115,6 +164,32 @@ body {
   letter-spacing: -0.01em;
 }
 .app-sub { margin: 0; color: var(--text-muted); font-size: 0.87rem; }
+
+.theme-toggle {
+  position: fixed;
+  top: 16px;
+  right: 20px;
+  z-index: 1001;
+  flex-shrink: 0;
+  width: 38px;
+  height: 38px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  border: 1.5px solid var(--border-strong);
+  background: var(--surface-alt);
+  color: var(--text);
+  cursor: pointer;
+  box-shadow: var(--shadow-sm);
+  transition: background 0.15s, border-color 0.15s, transform 0.15s;
+}
+.theme-toggle:hover { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-soft-text); }
+.theme-toggle:active { transform: scale(0.94); }
+.theme-toggle .icon-sun { display: none; }
+.theme-toggle .icon-moon { display: block; }
+:root[data-theme="dark"] .theme-toggle .icon-sun { display: block; }
+:root[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
 
 .banner {
   margin: 16px auto 0;
@@ -243,8 +318,8 @@ select:focus {
 .schedule-table thead th:first-child { border-top-left-radius: var(--radius-md); }
 .schedule-table thead th:last-child { border-top-right-radius: var(--radius-md); }
 .schedule-table tbody tr:hover td { background: var(--surface-alt); }
-.schedule-table tr.is-holiday td { background: #eef2fb; }
-.schedule-table tr.is-holiday:hover td { background: #e6ecfa; }
+.schedule-table tr.is-holiday td { background: var(--holiday-row-bg); }
+.schedule-table tr.is-holiday:hover td { background: var(--holiday-row-bg-hover); }
 .schedule-table .date-cell { white-space: nowrap; font-weight: 600; }
 .schedule-table .date-cell.holiday-text {
   color: var(--holiday-blue);
