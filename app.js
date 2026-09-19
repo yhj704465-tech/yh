@@ -526,6 +526,7 @@ function resetDraftUi() {
     '<p class="empty-hint">연도/월을 선택하고 "자동배정 생성"을 눌러주세요.</p>';
   document.getElementById('btnCommit').disabled = true;
   document.getElementById('btnExport').disabled = true;
+  document.getElementById('btnHandout').disabled = true;
   setStatus('', '');
 }
 
@@ -829,6 +830,145 @@ async function onExport() {
 }
 
 /* ============================================================
+ * 현장전달문서 (PDF) — 지게차/현장 근무자에게 나눠줄 문서.
+ * 실제 PDF 라이브러리 대신 인쇄 전용 화면을 새 창으로 띄우고
+ * "PDF로 저장"을 쓰게 한다. 브라우저 인쇄 기능은 한글 폰트를
+ * 그대로 쓰기 때문에, 폰트를 파일에 통째로 내장해야 하는
+ * jsPDF류보다 훨씬 가볍고 깨질 일이 없다.
+ * ============================================================ */
+function buildHandoutRows(draft) {
+  const rows = [];
+  draft.days.forEach((day) => {
+    if (day.isHoliday) return;
+    const weekdayLabel = day.dow === 'sat' ? '토' : '일';
+    const dateLabel = `${formatKoreanDate(day.date)}(${weekdayLabel})`;
+    if (day.forklift[0]) rows.push({ date: dateLabel, name: day.forklift[0] });
+    day.field.forEach((name) => {
+      if (name && name !== SCHEDULE_WORKER.name) rows.push({ date: dateLabel, name });
+    });
+  });
+  return rows;
+}
+
+function buildCalendarWeeks(year, month, draftByDate, data) {
+  const daysInMonth = new Date(year, month, 0).getDate();
+  const firstWeekday = new Date(year, month - 1, 1).getDay();
+  const cells = [];
+  for (let i = 0; i < firstWeekday; i++) cells.push(null);
+  for (let d = 1; d <= daysInMonth; d++) {
+    const iso = toISODate(new Date(year, month - 1, d));
+    const entry = draftByDate.get(iso);
+    const isHoliday = data.holidays.has(iso);
+    const names = [];
+    if (entry && !entry.isHoliday) {
+      if (entry.forklift[0]) names.push(entry.forklift[0]);
+      entry.field.forEach((n) => { if (n) names.push(n); });
+    }
+    cells.push({
+      day: d,
+      isHoliday,
+      holidayLabel: isHoliday ? (data.holidays.get(iso) || '휴무') : '',
+      names,
+    });
+  }
+  while (cells.length % 7 !== 0) cells.push(null);
+  const weeks = [];
+  for (let i = 0; i < cells.length; i += 7) weeks.push(cells.slice(i, i + 7));
+  return weeks;
+}
+
+function buildHandoutHtml(year, month, rows, weeks) {
+  const weekDayNames = ['일', '월', '화', '수', '목', '금', '토'];
+
+  const rowsHtml = rows.length
+    ? rows.map((r) => `<tr><td>${escapeHtml(r.date)}</td><td>${escapeHtml(r.name)}</td><td class="blank-cell"></td></tr>`).join('')
+    : '<tr><td colspan="3">배정 내역이 없습니다.</td></tr>';
+
+  const calendarHtml = weeks
+    .map((week) => `<tr>${week
+      .map((cell) => {
+        if (!cell) return '<td></td>';
+        if (cell.isHoliday) {
+          return `<td><div class="cal-date cal-holiday">${cell.day}</div><div class="cal-offday-badge">휴무 (${escapeHtml(cell.holidayLabel)})</div></td>`;
+        }
+        const namesHtml = cell.names.length
+          ? `<div class="cal-names">${cell.names.map(escapeHtml).join('<br>')}</div>`
+          : '';
+        return `<td><div class="cal-date">${cell.day}</div>${namesHtml}</td>`;
+      })
+      .join('')}</tr>`)
+    .join('');
+
+  return `<!doctype html>
+<html lang="ko"><head><meta charset="utf-8">
+<title>현장전달문서_${year}${String(month).padStart(2, '0')}</title>
+<link rel="stylesheet" as="style" crossorigin href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.css">
+<style>
+  @page { size: A4; margin: 14mm; }
+  * { box-sizing: border-box; }
+  body { font-family: "Pretendard", "Malgun Gothic", "맑은 고딕", sans-serif; color: #111; margin: 0; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { font-size: 12px; color: #555; margin: 0 0 18px; }
+  h2.section-title { font-size: 14px; margin: 22px 0 8px; border-left: 4px solid #4472C4; padding-left: 8px; }
+  table.assign-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  table.assign-table th, table.assign-table td { border: 1px solid #999; padding: 7px 9px; text-align: left; }
+  table.assign-table th { background: #ececec; }
+  .blank-cell { min-width: 110px; }
+  table.calendar { width: 100%; border-collapse: collapse; table-layout: fixed; }
+  table.calendar th { background: #ececec; padding: 6px; font-size: 12px; border: 1px solid #999; text-align: center; }
+  table.calendar td { border: 1px solid #999; vertical-align: top; height: 92px; padding: 5px; font-size: 10.5px; }
+  .cal-date { font-weight: 700; font-size: 11px; }
+  .cal-holiday { color: #4472C4; }
+  .cal-names { margin-top: 4px; line-height: 1.5; }
+  .cal-offday-badge { display: inline-block; margin-top: 4px; padding: 2px 6px; background: #eef2fb; color: #4472C4; border-radius: 4px; font-size: 9px; font-weight: 600; }
+</style>
+</head>
+<body>
+  <h1>풀필먼트2팀 현장전달문서</h1>
+  <p class="sub">${year}년 ${month}월 · 지게차 / 현장 근무자용 — 근무하신 날짜의 대체휴무일을 직접 적어 제출해주세요.</p>
+
+  <h2 class="section-title">근무 확인 및 대체휴무일 기재</h2>
+  <table class="assign-table">
+    <thead><tr><th style="width:130px;">날짜</th><th>이름</th><th class="blank-cell">대체휴무일 (직접 기입)</th></tr></thead>
+    <tbody>${rowsHtml}</tbody>
+  </table>
+
+  <h2 class="section-title">${month}월 달력</h2>
+  <table class="calendar">
+    <thead><tr>${weekDayNames.map((w) => `<th>${w}</th>`).join('')}</tr></thead>
+    <tbody>${calendarHtml}</tbody>
+  </table>
+</body></html>`;
+}
+
+function onHandoutDownload() {
+  if (!currentDraft) return;
+  const year = Number(yearSelectEl.value);
+  const month = Number(monthSelectEl.value);
+
+  const rows = buildHandoutRows(currentDraft);
+  const draftByDate = new Map(currentDraft.days.map((d) => [d.date, d]));
+  const weeks = buildCalendarWeeks(year, month, draftByDate, DATA);
+  const html = buildHandoutHtml(year, month, rows, weeks);
+
+  const printWindow = window.open('', '_blank');
+  if (!printWindow) {
+    setStatus('팝업이 차단되어 문서를 열 수 없습니다. 브라우저 팝업 차단을 해제해주세요.', 'error');
+    return;
+  }
+  printWindow.document.open();
+  printWindow.document.write(html);
+  printWindow.document.close();
+
+  const triggerPrint = () => { printWindow.focus(); printWindow.print(); };
+  if (printWindow.document.fonts && printWindow.document.fonts.ready) {
+    printWindow.document.fonts.ready.then(triggerPrint).catch(triggerPrint);
+  } else {
+    setTimeout(triggerPrint, 300);
+  }
+}
+
+/* ============================================================
  * 초기화 / 이벤트 바인딩
  * ============================================================ */
 async function reloadData() {
@@ -856,6 +996,7 @@ function onGenerate() {
   renderSchedule(currentDraft, DATA);
   document.getElementById('btnCommit').disabled = false;
   document.getElementById('btnExport').disabled = false;
+  document.getElementById('btnHandout').disabled = false;
   setStatus('배정표를 생성했습니다. 저장 전에 검토해주세요.', 'success');
 }
 
@@ -863,6 +1004,7 @@ document.getElementById('btnReload').addEventListener('click', reloadData);
 document.getElementById('btnGenerate').addEventListener('click', onGenerate);
 document.getElementById('btnCommit').addEventListener('click', onCommit);
 document.getElementById('btnExport').addEventListener('click', onExport);
+document.getElementById('btnHandout').addEventListener('click', onHandoutDownload);
 yearSelectEl.addEventListener('change', resetDraftUi);
 monthSelectEl.addEventListener('change', resetDraftUi);
 
