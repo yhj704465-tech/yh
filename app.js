@@ -883,7 +883,8 @@ document.getElementById('themeToggle').addEventListener('click', () => {
  * 로그인 게이트 — 서버가 없는 정적 사이트라 실제 보안은 아니고,
  * 아무나 못 들어오게 막는 간단한 화면 가림막입니다.
  * ============================================================ */
-const AUTH_STORAGE_KEY = 'ff2_authed';
+const AUTH_STORAGE_KEY = 'ff2_authed_at';
+const SESSION_DURATION_MS = 60 * 60 * 1000; // 1시간
 const VALID_ID = 'fastbox';
 const VALID_PW = 'fastbox@001';
 
@@ -893,12 +894,17 @@ function showApp() {
   reloadData();
 }
 
+function isSessionValid() {
+  const authedAt = Number(localStorage.getItem(AUTH_STORAGE_KEY));
+  return Boolean(authedAt) && Date.now() - authedAt < SESSION_DURATION_MS;
+}
+
 document.getElementById('loginForm').addEventListener('submit', (evt) => {
   evt.preventDefault();
   const id = document.getElementById('loginId').value.trim();
   const pw = document.getElementById('loginPw').value;
   if (id === VALID_ID && pw === VALID_PW) {
-    localStorage.setItem(AUTH_STORAGE_KEY, 'true');
+    localStorage.setItem(AUTH_STORAGE_KEY, String(Date.now()));
     document.getElementById('loginError').textContent = '';
     showApp();
   } else {
@@ -906,8 +912,9 @@ document.getElementById('loginForm').addEventListener('submit', (evt) => {
   }
 });
 
-if (localStorage.getItem(AUTH_STORAGE_KEY) === 'true') {
+if (isSessionValid()) {
   showApp();
 } else {
+  localStorage.removeItem(AUTH_STORAGE_KEY);
   document.getElementById('loginGate').style.display = 'flex';
 }
