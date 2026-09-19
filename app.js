@@ -478,10 +478,23 @@ function computeWeekendExclusion(prevEntry, dow, date, group, data) {
 // 토·일 합쳐 10일까지 있는 달엔 규칙9와 맞물려 못 채우는 날이 생김) 3회로 둔다.
 const MONTHLY_CAP_BY_GROUP = { managers: 2, forklift: 3, field: 2 };
 
-function namesAtMonthlyCap(monthlyMap, group) {
-  const cap = MONTHLY_CAP_BY_GROUP[group];
+/** 입사 후 유예기간(기본 1개월)이 끝나 처음 배정 대상에 들어가는 바로 그 달인지 */
+function isFirstEligibleMonth(member, year, month) {
+  if (!member.joinDate) return false;
+  const graceDate = addMonths(parseISODate(member.joinDate), CONFIG.rules.newHireGraceMonths);
+  return graceDate.getFullYear() === year && graceDate.getMonth() === month - 1;
+}
+
+function namesAtMonthlyCap(monthlyMap, group, members, year, month) {
+  const groupCap = MONTHLY_CAP_BY_GROUP[group];
+  const memberByName = new Map(members.map((m) => [m.name, m]));
   const result = new Set();
-  monthlyMap.forEach((c, name) => { if (c >= cap) result.add(name); });
+  monthlyMap.forEach((c, name) => {
+    const member = memberByName.get(name);
+    // 신규 입사자는 처음 배정 대상이 되는 달엔 그룹 상한 대신 1회로 더 천천히 적응시킨다.
+    const cap = member && isFirstEligibleMonth(member, year, month) ? 1 : groupCap;
+    if (c >= cap) result.add(name);
+  });
   return result;
 }
 
@@ -533,15 +546,15 @@ function generateMonthSchedule(year, month, data) {
     const prevEntry = dow === 'sun' ? days[days.length - 1] : null;
     const excludeManagers = new Set([
       ...computeWeekendExclusion(prevEntry, dow, date, 'managers', data),
-      ...namesAtMonthlyCap(monthlyPicks.managers, 'managers'),
+      ...namesAtMonthlyCap(monthlyPicks.managers, 'managers', workingMembers.managers, year, month),
     ]);
     const excludeForklift = new Set([
       ...computeWeekendExclusion(prevEntry, dow, date, 'forklift', data),
-      ...namesAtMonthlyCap(monthlyPicks.forklift, 'forklift'),
+      ...namesAtMonthlyCap(monthlyPicks.forklift, 'forklift', workingMembers.forklift, year, month),
     ]);
     const excludeField = new Set([
       ...computeWeekendExclusion(prevEntry, dow, date, 'field', data),
-      ...namesAtMonthlyCap(monthlyPicks.field, 'field'),
+      ...namesAtMonthlyCap(monthlyPicks.field, 'field', workingMembers.field, year, month),
     ]);
 
     const mgrResult = assignSingleSlot(workingMembers.managers, date, excludeManagers, owed.managers);
