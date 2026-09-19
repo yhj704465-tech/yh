@@ -837,17 +837,18 @@ async function onExport() {
  * jsPDF류보다 훨씬 가볍고 깨질 일이 없다.
  * ============================================================ */
 function buildHandoutRows(draft) {
-  const rows = [];
+  const forkliftRows = [];
+  const fieldRows = [];
   draft.days.forEach((day) => {
     if (day.isHoliday) return;
     const weekdayLabel = day.dow === 'sat' ? '토' : '일';
     const dateLabel = `${formatKoreanDate(day.date)}(${weekdayLabel})`;
-    if (day.forklift[0]) rows.push({ date: dateLabel, name: day.forklift[0] });
+    if (day.forklift[0]) forkliftRows.push({ date: dateLabel, name: day.forklift[0] });
     day.field.forEach((name) => {
-      if (name && name !== SCHEDULE_WORKER.name) rows.push({ date: dateLabel, name });
+      if (name && name !== SCHEDULE_WORKER.name) fieldRows.push({ date: dateLabel, name });
     });
   });
-  return rows;
+  return { forkliftRows, fieldRows };
 }
 
 function buildCalendarWeeks(year, month, draftByDate, data) {
@@ -883,14 +884,14 @@ function buildAssignColumnHtml(rows) {
   return `<table class="assign-table"><thead><tr><th style="width:110px;">날짜</th><th>이름</th><th class="blank-cell">대체휴무일</th></tr></thead><tbody>${rowsHtml}</tbody></table>`;
 }
 
-function buildHandoutHtml(year, month, rows, weeks) {
+function buildHandoutHtml(year, month, forkliftRows, fieldRows, weeks) {
   const weekDayNames = ['일', '월', '화', '수', '목', '금', '토'];
 
-  // 근무 목록이 길어도 한 페이지에 들어가도록 좌우 2단으로 나눠서 배치한다.
-  const half = Math.ceil(rows.length / 2);
-  const colA = rows.slice(0, half);
-  const colB = rows.slice(half);
-  const assignColumnsHtml = `<div class="assign-columns">${buildAssignColumnHtml(colA)}${buildAssignColumnHtml(colB)}</div>`;
+  // 지게차는 하루 1명뿐이라 표 하나로 충분하고, 현장은 인원이 많아서
+  // 한 페이지에 들어가도록 좌우 2단으로 나눠서 배치한다.
+  const forkliftTableHtml = buildAssignColumnHtml(forkliftRows);
+  const fieldHalf = Math.ceil(fieldRows.length / 2);
+  const fieldColumnsHtml = `<div class="assign-columns">${buildAssignColumnHtml(fieldRows.slice(0, fieldHalf))}${buildAssignColumnHtml(fieldRows.slice(fieldHalf))}</div>`;
 
   const calendarHtml = weeks
     .map((week) => `<tr>${week
@@ -941,8 +942,11 @@ function buildHandoutHtml(year, month, rows, weeks) {
   <h1>풀필먼트2팀 현장전달문서</h1>
   <p class="sub">${year}년 ${month}월 · 지게차 / 현장 근무자용 — 근무하신 날짜의 대체휴무일을 직접 적어 제출해주세요.</p>
 
-  <h2 class="section-title">근무 확인 및 대체휴무일 기재</h2>
-  ${assignColumnsHtml}
+  <h2 class="section-title">지게차 근무 확인 및 대체휴무일 기재</h2>
+  ${forkliftTableHtml}
+
+  <h2 class="section-title">현장 근무 확인 및 대체휴무일 기재</h2>
+  ${fieldColumnsHtml}
 
   <h2 class="section-title">${month}월 달력</h2>
   <table class="calendar">
@@ -957,10 +961,10 @@ function onHandoutDownload() {
   const year = Number(yearSelectEl.value);
   const month = Number(monthSelectEl.value);
 
-  const rows = buildHandoutRows(currentDraft);
+  const { forkliftRows, fieldRows } = buildHandoutRows(currentDraft);
   const draftByDate = new Map(currentDraft.days.map((d) => [d.date, d]));
   const weeks = buildCalendarWeeks(year, month, draftByDate, DATA);
-  const html = buildHandoutHtml(year, month, rows, weeks);
+  const html = buildHandoutHtml(year, month, forkliftRows, fieldRows, weeks);
 
   const printWindow = window.open('', '_blank');
   if (!printWindow) {
