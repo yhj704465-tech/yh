@@ -473,6 +473,25 @@ function computeWeekendExclusion(prevEntry, dow, date, group, data) {
   return namesWithLastWorked(data[group].members, previousDayIso(date));
 }
 
+// 한 사람이 한 달에 배정될 수 있는 최대 횟수 (그룹별 독립).
+// 지게차는 인원이 5명뿐이라 2회로 두면 여유가 전혀 없어서(5명×2=10자리인데
+// 토·일 합쳐 10일까지 있는 달엔 규칙9와 맞물려 못 채우는 날이 생김) 3회로 둔다.
+const MONTHLY_CAP_BY_GROUP = { managers: 2, forklift: 3, field: 2 };
+
+function namesAtMonthlyCap(monthlyMap, group) {
+  const cap = MONTHLY_CAP_BY_GROUP[group];
+  const result = new Set();
+  monthlyMap.forEach((c, name) => { if (c >= cap) result.add(name); });
+  return result;
+}
+
+function bumpMonthlyPicks(monthlyMap, names, skipNames) {
+  names.forEach((name) => {
+    if (!name || (skipNames && skipNames.has(name))) return;
+    monthlyMap.set(name, (monthlyMap.get(name) || 0) + 1);
+  });
+}
+
 function generateMonthSchedule(year, month, data) {
   const dates = getWeekendDatesInMonth(year, month);
   const workingMembers = {
@@ -485,6 +504,10 @@ function generateMonthSchedule(year, month, data) {
     forklift: new Set(data.tieBreakHistory.forklift),
     field: new Set(data.tieBreakHistory.field),
   };
+  // 이번 달 동안 각 사람이 몇 번 배정됐는지 — 월별 상한(2회) 체크용.
+  // 고정근무자는 상한 대상이 아니라서 애초에 여기 안 쌓는다.
+  const monthlyPicks = { managers: new Map(), forklift: new Map(), field: new Map() };
+  const fieldScheduleWorkerNames = getScheduleWorkerNameSet(data.field.members);
 
   const days = [];
 
@@ -508,9 +531,18 @@ function generateMonthSchedule(year, month, data) {
     }
 
     const prevEntry = dow === 'sun' ? days[days.length - 1] : null;
-    const excludeManagers = computeWeekendExclusion(prevEntry, dow, date, 'managers', data);
-    const excludeForklift = computeWeekendExclusion(prevEntry, dow, date, 'forklift', data);
-    const excludeField = computeWeekendExclusion(prevEntry, dow, date, 'field', data);
+    const excludeManagers = new Set([
+      ...computeWeekendExclusion(prevEntry, dow, date, 'managers', data),
+      ...namesAtMonthlyCap(monthlyPicks.managers, 'managers'),
+    ]);
+    const excludeForklift = new Set([
+      ...computeWeekendExclusion(prevEntry, dow, date, 'forklift', data),
+      ...namesAtMonthlyCap(monthlyPicks.forklift, 'forklift'),
+    ]);
+    const excludeField = new Set([
+      ...computeWeekendExclusion(prevEntry, dow, date, 'field', data),
+      ...namesAtMonthlyCap(monthlyPicks.field, 'field'),
+    ]);
 
     const mgrResult = assignSingleSlot(workingMembers.managers, date, excludeManagers, owed.managers);
     entry.managers = mgrResult.picked;
@@ -534,6 +566,10 @@ function generateMonthSchedule(year, month, data) {
     bumpWorkingMembers(workingMembers.managers, entry.managers, iso);
     bumpWorkingMembers(workingMembers.forklift, entry.forklift, iso);
     bumpWorkingMembers(workingMembers.field, entry.field, iso);
+
+    bumpMonthlyPicks(monthlyPicks.managers, entry.managers);
+    bumpMonthlyPicks(monthlyPicks.forklift, entry.forklift);
+    bumpMonthlyPicks(monthlyPicks.field, entry.field, fieldScheduleWorkerNames);
 
     days.push(entry);
   }
