@@ -12,6 +12,9 @@
  *              여러 개면 "토요일,일요일"처럼 쉼표로 구분.
  *   - tieBreakHistory : 그룹 | 이름
  *   - holidays : 날짜 | 설명
+ * fieldConfigCsv (선택) : 현장 토/일 필요인원을 시트에서 관리하고 싶을 때만 채우기
+ *   - 요일 | 필요인원 | 최소FB   (요일: "토"/"일")
+ *   - 비워두면 기존과 동일하게 토4/일2/FB최소1로 동작합니다.
  * appsScriptUrl : Apps Script를 웹앱으로 배포한 .../exec 주소
  * ============================================================ */
 const CONFIG = {
@@ -22,6 +25,7 @@ const CONFIG = {
     tieBreakHistory: 'https://docs.google.com/spreadsheets/d/e/2PACX-1vSJDCbE2_IAeJws9NdoGOvq4xWP5O1FRqd1dgSTnjg8hGfJzSWPB_uY6GBDO2ERwGtIdcx7ZAeSZWRg/pub?gid=586751447&single=true&output=csv',
     holidays: 'https://docs.google.com/spreadsheets/d/e/2PACX-1vSJDCbE2_IAeJws9NdoGOvq4xWP5O1FRqd1dgSTnjg8hGfJzSWPB_uY6GBDO2ERwGtIdcx7ZAeSZWRg/pub?gid=732531628&single=true&output=csv',
   },
+  fieldConfigCsv: 'https://docs.google.com/spreadsheets/d/e/2PACX-1vSJDCbE2_IAeJws9NdoGOvq4xWP5O1FRqd1dgSTnjg8hGfJzSWPB_uY6GBDO2ERwGtIdcx7ZAeSZWRg/pub?gid=1178110041&single=true&output=csv',
   appsScriptUrl: 'https://script.google.com/macros/s/AKfycbzeXNoXgwrPhQCVXRIEJKGY4ZH2XWZ2U49gxCdB_QScQSITTrpC6g6Efje9zbOaU5y5/exec',
   rules: {
     newHireGraceMonths: 1,
@@ -78,7 +82,8 @@ const MOCK_DATA = {
     label: '현장',
     requiredSat: 4,
     requiredSun: 2,
-    minFbPerDay: 1,
+    minFbSat: 1,
+    minFbSun: 1,
     members: [
       { name: '진영미', fb: true, count: 1, lastWorked: '2026-09-05' },
       { name: '박준호', fb: false, count: 1, lastWorked: '2026-09-05' },
@@ -256,6 +261,30 @@ function parseTieBreakRows(rows) {
   return result;
 }
 
+const FIELD_CONFIG_DEFAULTS = { requiredSat: 4, requiredSun: 2, minFbSat: 1, minFbSun: 1 };
+
+async function loadFieldConfig() {
+  const url = CONFIG.fieldConfigCsv;
+  if (!url || !url.startsWith('http')) return { ...FIELD_CONFIG_DEFAULTS };
+  try {
+    const rows = await fetchCsv(url, `cachebust=${Date.now()}`);
+    const result = { ...FIELD_CONFIG_DEFAULTS };
+    rows.forEach((r) => {
+      const day = (r['요일'] || '').trim();
+      const required = Number(r['필요인원']);
+      const minFb = Number(r['최소FB']);
+      const key = day.startsWith('토') ? 'Sat' : day.startsWith('일') ? 'Sun' : null;
+      if (!key) return;
+      if (!Number.isNaN(required)) result[`required${key}`] = required;
+      if (!Number.isNaN(minFb)) result[`minFb${key}`] = minFb;
+    });
+    return result;
+  } catch (err) {
+    console.warn('FieldConfig 로드 실패, 기본값(토4/일2/FB1)으로 동작합니다:', err);
+    return { ...FIELD_CONFIG_DEFAULTS };
+  }
+}
+
 async function loadData() {
   const banner = document.getElementById('configBanner');
   if (!isConfigured()) {
@@ -265,12 +294,13 @@ async function loadData() {
   banner.hidden = true;
 
   const bust = `cachebust=${Date.now()}`;
-  const [managersRows, forkliftRows, fieldRows, tieRows, holidayRows] = await Promise.all([
+  const [managersRows, forkliftRows, fieldRows, tieRows, holidayRows, fieldConfig] = await Promise.all([
     fetchCsv(CONFIG.csv.managers, bust),
     fetchCsv(CONFIG.csv.forklift, bust),
     fetchCsv(CONFIG.csv.field, bust),
     fetchCsv(CONFIG.csv.tieBreakHistory, bust),
     fetchCsv(CONFIG.csv.holidays, bust),
+    loadFieldConfig(),
   ]);
 
   return {
@@ -278,9 +308,10 @@ async function loadData() {
     forklift: { label: '지게차', requiredPerDay: 1, members: forkliftRows.map(parseRosterRow).filter((m) => m.name) },
     field: {
       label: '현장',
-      requiredSat: 4,
-      requiredSun: 2,
-      minFbPerDay: 1,
+      requiredSat: fieldConfig.requiredSat,
+      requiredSun: fieldConfig.requiredSun,
+      minFbSat: fieldConfig.minFbSat,
+      minFbSun: fieldConfig.minFbSun,
       members: fieldRows.map(parseFieldRow).filter((m) => m.name),
     },
     tieBreakHistory: parseTieBreakRows(tieRows),
@@ -469,8 +500,9 @@ function generateMonthSchedule(year, month, data) {
     if (fkResult.shortfall) entry.warnings.push(`지게차 인원 부족 (${fkResult.shortfall}명 미배정)`);
 
     const requiredTotal = dow === 'sat' ? data.field.requiredSat : data.field.requiredSun;
+    const minFbPerDay = dow === 'sat' ? data.field.minFbSat : data.field.minFbSun;
     const fieldResult = assignFieldDay(
-      workingMembers.field, data.field.minFbPerDay, date, requiredTotal, excludeField, owed.field
+      workingMembers.field, minFbPerDay, date, requiredTotal, excludeField, owed.field
     );
     entry.field = fieldResult.picked;
     owed.field = fieldResult.owedSet;
@@ -520,14 +552,14 @@ function setStatus(msg, type) {
   el.className = 'status-line' + (type ? ` ${type}` : '');
 }
 
-function resetDraftUi() {
+function resetDraftUi(clearStatus = true) {
   currentDraft = null;
   document.getElementById('scheduleContainer').innerHTML =
     '<p class="empty-hint">연도/월을 선택하고 "자동배정 생성"을 눌러주세요.</p>';
   document.getElementById('btnCommit').disabled = true;
   document.getElementById('btnExport').disabled = true;
   document.getElementById('btnHandout').disabled = true;
-  setStatus('', '');
+  if (clearStatus) setStatus('', '');
 }
 
 function decorateFieldName(name, data) {
@@ -584,7 +616,7 @@ function renderSchedule(draft, data) {
     return;
   }
 
-  const fieldCols = data.field.requiredSat;
+  const fieldCols = Math.max(data.field.requiredSat, data.field.requiredSun);
 
   let html = '<table class="schedule-table"><thead><tr>';
   html += '<th>날짜</th><th>관리자</th><th>지게차</th>';
@@ -779,7 +811,7 @@ async function onExport() {
     const monthLabel = `${yearSelectEl.value}년 ${monthSelectEl.value}월`;
     const sheet = wb.addWorksheet(monthLabel, { properties: { tabColor: { argb: 'FFDBDBDB' } } });
 
-    const fieldCols = DATA.field.requiredSat;
+    const fieldCols = Math.max(DATA.field.requiredSat, DATA.field.requiredSun);
     const headers = ['날짜', '관리자', '지게차', ...Array.from({ length: fieldCols }, (_, i) => `현장${i + 1}`)];
     sheet.addRow(headers);
 
@@ -1004,7 +1036,7 @@ async function reloadData() {
     document.getElementById('btnReload').disabled = false;
     document.getElementById('btnGenerate').disabled = false;
   }
-  resetDraftUi();
+  resetDraftUi(false);
 }
 
 function onGenerate() {
