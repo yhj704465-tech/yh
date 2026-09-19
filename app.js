@@ -904,28 +904,28 @@ function buildHandoutHtml(year, month, rows, weeks) {
 <title>현장전달문서_${year}${String(month).padStart(2, '0')}</title>
 <link rel="stylesheet" as="style" crossorigin href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.css">
 <style>
-  @page { size: A4; margin: 14mm; }
+  @page { size: A4 portrait; margin: 10mm; }
   * { box-sizing: border-box; }
   body { font-family: "Pretendard", "Malgun Gothic", "맑은 고딕", sans-serif; color: #111; margin: 0; }
-  h1 { font-size: 18px; margin: 0 0 4px; }
-  .sub { font-size: 12px; color: #555; margin: 0 0 18px; }
-  h2.section-title { font-size: 14px; margin: 22px 0 8px; border-left: 4px solid #4472C4; padding-left: 8px; }
-  h2.calendar-title { page-break-before: always; break-before: page; margin-top: 0; padding-top: 4px; }
-  table.assign-table { width: 100%; border-collapse: collapse; font-size: 12px; }
-  table.assign-table th, table.assign-table td { border: 1px solid #999; padding: 7px 9px; text-align: left; }
+  h1 { font-size: 17px; margin: 0 0 4px; }
+  .sub { font-size: 11px; color: #555; margin: 0 0 14px; }
+  h2.section-title { font-size: 13px; margin: 16px 0 6px; border-left: 4px solid #4472C4; padding-left: 8px; }
+  h2.calendar-title { page-break-before: always; break-before: page; margin-top: 0; padding-top: 0; }
+  table.assign-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+  table.assign-table th, table.assign-table td { border: 1px solid #999; padding: 5px 8px; text-align: left; }
   table.assign-table th { background: #ececec; }
   table.assign-table thead { display: table-header-group; }
   table.assign-table tr { page-break-inside: avoid; break-inside: avoid; }
-  .blank-cell { min-width: 110px; }
+  .blank-cell { min-width: 100px; }
   table.calendar { width: 100%; border-collapse: collapse; table-layout: fixed; page-break-inside: avoid; break-inside: avoid; }
   table.calendar thead { display: table-header-group; }
   table.calendar tr { page-break-inside: avoid; break-inside: avoid; }
-  table.calendar th { background: #ececec; padding: 6px; font-size: 12px; border: 1px solid #999; text-align: center; }
-  table.calendar td { border: 1px solid #999; vertical-align: top; height: 92px; padding: 5px; font-size: 10.5px; page-break-inside: avoid; break-inside: avoid; }
-  .cal-date { font-weight: 700; font-size: 11px; }
+  table.calendar th { background: #ececec; padding: 4px; font-size: 11px; border: 1px solid #999; text-align: center; }
+  table.calendar td { border: 1px solid #999; vertical-align: top; height: 62px; padding: 3px 4px; font-size: 9px; page-break-inside: avoid; break-inside: avoid; overflow: hidden; }
+  .cal-date { font-weight: 700; font-size: 9.5px; }
   .cal-holiday { color: #4472C4; }
-  .cal-names { margin-top: 4px; line-height: 1.5; }
-  .cal-offday-badge { display: inline-block; margin-top: 4px; padding: 2px 6px; background: #eef2fb; color: #4472C4; border-radius: 4px; font-size: 9px; font-weight: 600; }
+  .cal-names { margin-top: 2px; line-height: 1.25; }
+  .cal-offday-badge { display: inline-block; margin-top: 2px; padding: 1px 4px; background: #eef2fb; color: #4472C4; border-radius: 4px; font-size: 8px; font-weight: 600; }
 </style>
 </head>
 <body>
