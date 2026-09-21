@@ -18,7 +18,8 @@
  *   - tieBreakHistory : 그룹 | 이름
  *   - holidays : 날짜 | 설명
  * fieldConfigCsv (선택) : 현장 토/일 필요인원을 시트에서 관리하고 싶을 때만 채우기
- *   - 요일 | 필요인원 | 최소FB   (요일: "토"/"일")
+ *   - 요일 | 부서 | 필요인원 | 최소FB   (요일: "토"/"일". 최소FB는 강제가 아닌 "권장" 인원,
+ *     0이면 FB를 신경 쓰지 않음. 부서 열이 없는 옛 형식도 읽는다)
  *   - 비워두면 기존과 동일하게 토4/일2/FB최소1로 동작합니다.
  * appsScriptUrl : Apps Script를 웹앱으로 배포한 .../exec 주소
  * ============================================================ */
@@ -453,14 +454,14 @@ async function loadData() {
 /* ============================================================
  * 배정 알고리즘
  *
- * 우선순위: 누적횟수 오름차순 → 최근근무일 오름차순(오래전 우선) →
- *           지난 동률에서 밀린 이력(owed) 우선 → 이름순(최종 결정론적 fallback)
+ * 우선순위: 요일 교대(직전과 다른 요일 우선) → 누적횟수 오름차순 →
+ *           최근근무일 오름차순(오래전 우선) → 지난 동률에서 밀린 이력(owed) 우선 →
+ *           (FB 권장이 안 채워졌을 때만) FB 우선 → 이름순(최종 결정론적 fallback)
  *
- * 현장 그룹은 최소 FB 인원 제약이 있어, 순위대로 뽑은 뒤 부족하면
- * "가장 순위가 낮은 비FB 인원"과 "선발되지 못한 FB 인원 중 최상위"를
- * 교체하는 방식으로 보정합니다. 이 보정 교체는 동률 이력(owed) 계산에는
- * 반영하지 않습니다 — owed는 순수 횟수/최근근무일 동률에 대한 이력이고,
- * FB 제약에 의한 교체는 별개의 하드 룰이기 때문입니다.
+ * 현장 그룹의 최소 FB 인원은 강제가 아니라 "권장"이다. 공평성이 최우선이라서
+ * 공평성 순위로 뽑았을 때 FB가 모자라도 순위를 뒤집어 FB를 끼워 넣지 않고,
+ * 위 순위가 완전히 같은 사람들 사이에서만 FB를 우선한다. 못 채운 날은
+ * 경고(빨강)가 아니라 참고 안내로만 표시한다.
  * ============================================================ */
 function isEligible(member, date) {
   const dow = date.getDay();
@@ -486,11 +487,18 @@ function lastShiftDow(member) {
  * 절대 규칙이 아니라 "우선순위"다 — 현장은 토요일 자리가 일요일보다 많아서
  * (예: 토3·일2) 모두가 엄격히 교대하면 매 주말 토요일 후보가 1명씩 줄어 결국
  * 못 채운다. 그래서 교대에 맞는 사람을 먼저 뽑고, 모자라면 나머지에서 채운다.
- * 제외요일이 있는 사람(지게차 토/일 고정 인원 등)은 애초에 교대할 수 없어서 대상에서 뺀다.
+ * 제외요일이 있는 사람(지게차 토/일 고정 인원, 일요일 불가 현장 인원 등)은 애초에
+ * 교대할 수 없다. 이 사람들을 "교대 맞음(0)"으로 두면 교대가 횟수보다 앞서는 순위 때문에
+ * 항상 남들보다 먼저 뽑혀 횟수가 크게 벌어진다(실데이터 6개월 시뮬레이션에서 다른 인원보다 +5회).
+ * 그래서 "같은 요일 반복(1)"과 같은 취급을 하고, 교대 예외 통계에서는 뺀다.
  */
+function isAlternationExempt(member) {
+  return !!(member.excludedWeekdays && member.excludedWeekdays.size);
+}
+
 function alternationClass(member, dow) {
   if (!dow) return 0;
-  if (member.excludedWeekdays && member.excludedWeekdays.size) return 0;
+  if (isAlternationExempt(member)) return 1;
   return lastShiftDow(member) === dow ? 1 : 0;
 }
 
@@ -498,7 +506,7 @@ function tieKeyFor(dow) {
   return (m) => `${alternationClass(m, dow)}|${m.count}|${m.lastWorked || ''}`;
 }
 
-function rankCandidates(members, eligible, owedSet, dow) {
+function rankCandidates(members, eligible, owedSet, dow, preferFb = false) {
   const candidates = members.filter(eligible);
   const cls = new Map(candidates.map((m) => [m.name, alternationClass(m, dow)]));
   return candidates
@@ -514,6 +522,8 @@ function rankCandidates(members, eligible, owedSet, dow) {
       const aOwed = owedSet.has(a.name);
       const bOwed = owedSet.has(b.name);
       if (aOwed !== bOwed) return aOwed ? -1 : 1;
+      // 공평성 순위(교대·횟수·최근근무일·동률이력)가 전부 같을 때만 FB 권장을 반영한다
+      if (preferFb && a.fb !== b.fb) return a.fb ? -1 : 1;
       return a.name.localeCompare(b.name, 'ko');
     });
 }
@@ -538,8 +548,13 @@ function selectTopWithTieBreak(ranked, k, owedSet, keyOf) {
   return { selected, owedSet: nextOwed, shortfall: 0 };
 }
 
+// 교대 통계는 교대가 가능한 사람만 센다 (제외요일자는 어차피 교대할 수 없음)
+function alternationTotal(selected) {
+  return selected.filter((m) => !isAlternationExempt(m)).length;
+}
+
 function countAlternationExceptions(selected, dow) {
-  return selected.filter((m) => alternationClass(m, dow) === 1).length;
+  return selected.filter((m) => !isAlternationExempt(m) && alternationClass(m, dow) === 1).length;
 }
 
 function assignSingleSlot(members, date, dow, excludeNames, owedSet) {
@@ -550,7 +565,7 @@ function assignSingleSlot(members, date, dow, excludeNames, owedSet) {
     picked: selected.map((m) => m.name),
     owedSet: newOwed,
     shortfall,
-    altTotal: selected.length,
+    altTotal: alternationTotal(selected),
     altExceptions: countAlternationExceptions(selected, dow),
   };
 }
@@ -560,34 +575,36 @@ function assignFieldDay(members, minFbPerDay, date, dow, requiredTotal, excludeN
   const rotationPool = members.filter((m) => !m.scheduleWorker);
   const rotationNeeded = Math.max(0, requiredTotal - scheduleWorkers.length);
   const eligible = (m) => isEligible(m, date) && !excludeNames.has(m.name);
-  const ranked = rankCandidates(rotationPool, eligible, owedSet, dow);
-  let { selected, owedSet: newOwed, shortfall } = selectTopWithTieBreak(ranked, rotationNeeded, owedSet, tieKeyFor(dow));
+  const scheduleFb = scheduleWorkers.filter((m) => m.fb).length;
+  const fbOf = (sel) => scheduleFb + sel.filter((m) => m.fb).length;
+
+  // 공평성(요일 교대 → 누적횟수 → 최근근무일 → 동률이력)이 최우선이다.
+  let result = selectTopWithTieBreak(
+    rankCandidates(rotationPool, eligible, owedSet, dow), rotationNeeded, owedSet, tieKeyFor(dow)
+  );
+  // FB 최소 인원은 "권장"일 뿐이다. 공평성 순위가 완전히 같은 사람들 사이에서만 FB를 우선해서,
+  // 그렇게 해서 FB가 늘어날 때만 채택한다 (순위를 뒤집어 FB를 끼워 넣지 않는다).
+  if (rotationNeeded > 0 && fbOf(result.selected) < minFbPerDay) {
+    const preferred = selectTopWithTieBreak(
+      rankCandidates(rotationPool, eligible, owedSet, dow, true), rotationNeeded, owedSet, tieKeyFor(dow)
+    );
+    if (fbOf(preferred.selected) > fbOf(result.selected)) result = preferred;
+  }
+  const { selected, owedSet: newOwed, shortfall } = result;
 
   const warnings = [];
-  const fbCount = scheduleWorkers.filter((m) => m.fb).length + selected.filter((m) => m.fb).length;
-  if (fbCount < minFbPerDay && rotationNeeded > 0) {
-    const selectedNames = new Set(selected.map((m) => m.name));
-    const bestFbOutside = ranked.find((m) => m.fb && !selectedNames.has(m.name));
-    if (bestFbOutside) {
-      let removeIdx = -1;
-      for (let i = selected.length - 1; i >= 0; i--) {
-        if (!selected[i].fb) { removeIdx = i; break; }
-      }
-      selected = selected.slice();
-      if (removeIdx >= 0) selected.splice(removeIdx, 1, bestFbOutside);
-      else selected.push(bestFbOutside);
-    } else {
-      warnings.push(`${label} FB(월급제·시급제) 인원이 부족해 최소 ${minFbPerDay}명 조건을 채우지 못했습니다.`);
-    }
-  }
-
+  const notes = [];
   if (shortfall) warnings.push(`${label} 인원 부족 (${shortfall}명 미배정)`);
+  if (minFbPerDay > 0 && fbOf(selected) < minFbPerDay) {
+    notes.push(`${label} FB 권장 ${minFbPerDay}명 중 ${fbOf(selected)}명 (공평 배정 우선)`);
+  }
 
   return {
     picked: [...scheduleWorkers.map((m) => m.name), ...selected.map((m) => m.name)],
     owedSet: newOwed,
     warnings,
-    altTotal: selected.length,
+    notes,
+    altTotal: alternationTotal(selected),
     altExceptions: countAlternationExceptions(selected, dow),
   };
 }
@@ -732,6 +749,7 @@ function generateMonthSchedule(year, month, data, mode = currentMode) {
       field: [],
       fieldByDept: {},
       warnings: [],
+      notes: [], // 경고(빨강)가 아닌 참고 안내 — FB 권장 미충족 등
     };
 
     if (isHoliday) {
@@ -778,6 +796,7 @@ function generateMonthSchedule(year, month, data, mode = currentMode) {
       entry.fieldByDept[pool.key] = fieldResult.picked;
       owed.field = fieldResult.owedSet;
       entry.warnings.push(...fieldResult.warnings);
+      entry.notes.push(...fieldResult.notes);
       stats.altTotal += fieldResult.altTotal;
       stats.altExceptions += fieldResult.altExceptions;
     });
@@ -794,6 +813,7 @@ function generateMonthSchedule(year, month, data, mode = currentMode) {
     days.push(entry);
   }
 
+  stats.fbNoteDays = days.filter((d) => d.notes.length).length;
   return { days, owed, workingMembers, pools, mode, stats };
 }
 
@@ -952,9 +972,11 @@ function renderSchedule(draft, data) {
     }
     html += '</tr>';
 
-    if (!day.isHoliday && day.warnings.length) {
+    const notes = day.notes || [];
+    if (!day.isHoliday && (day.warnings.length || notes.length)) {
       html += `<tr class="${rowClass}"><td></td><td colspan="${1 + fieldCols}">`;
       html += day.warnings.map((w) => `<span class="warn-tag">${escapeHtml(w)}</span>`).join(' ');
+      html += notes.map((n) => `<span class="note-tag">${escapeHtml(n)}</span>`).join(' ');
       html += '</td></tr>';
     }
   });
@@ -1403,11 +1425,12 @@ function onGenerate() {
   document.getElementById('btnCommit').disabled = false;
   document.getElementById('btnExport').disabled = false;
   document.getElementById('btnHandout').disabled = false;
-  const { altTotal, altExceptions } = currentDraft.stats;
+  const { altTotal, altExceptions, fbNoteDays } = currentDraft.stats;
   const altMsg = altExceptions
     ? ` 요일 교대 예외 ${altExceptions}/${altTotal}건 (인원이 모자라 같은 요일을 연속 배정).`
     : '';
-  setStatus(`[${getModeLabel(currentMode)}] 배정표를 생성했습니다.${altMsg} 저장 전에 검토해주세요.`, 'success');
+  const fbMsg = fbNoteDays ? ` FB 권장 미충족 ${fbNoteDays}일 (공평 배정 우선).` : '';
+  setStatus(`[${getModeLabel(currentMode)}] 배정표를 생성했습니다.${altMsg}${fbMsg} 저장 전에 검토해주세요.`, 'success');
 }
 
 function updateModeButtons() {
