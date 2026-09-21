@@ -20,6 +20,8 @@
  * fieldConfigCsv (선택) : 현장 토/일 필요인원을 시트에서 관리하고 싶을 때만 채우기
  *   - 요일 | 부서 | 필요인원   (요일: "토"/"일". 부서 열이 없는 옛 형식도 읽는다.
  *     예전에 쓰던 "최소FB" 열이 남아 있어도 무시한다)
+ *   - 부서 칸에 "지게차" 또는 "관리자"를 적으면 그 그룹의 요일별 하루 필요인원이 된다.
+ *     (예: 토요일 | 지게차 | 2). 적지 않으면 하루 1명이다. 0이면 그 요일엔 배정하지 않는다.
  *   - 비워두면 운영1 토1/일2 + 운영2 토2/일2로 동작합니다.
  * appsScriptUrl : Apps Script를 웹앱으로 배포한 .../exec 주소
  * ============================================================ */
@@ -83,6 +85,29 @@ function sumFieldTotals(byDept) {
   };
 }
 
+/**
+ * 관리자·지게차의 요일별 하루 필요인원. FieldConfig 시트에 행이 없으면 하루 1명.
+ * (현장은 부서별로 따로 관리하니 getFieldPools를 쓴다)
+ */
+const DEFAULT_GROUP_REQUIRED = { sat: 1, sun: 1 };
+const CONFIG_GROUP_BY_LABEL = { '관리자': 'managers', '지게차': 'forklift' };
+
+function getGroupRequired(data, group, dow) {
+  const r = (data[group] && data[group].required) || DEFAULT_GROUP_REQUIRED;
+  return dow === 'sat' ? r.sat : r.sun;
+}
+
+/** 표에 필요한 칸(열) 수 = 토·일 중 더 많이 필요한 쪽 */
+function getGroupCols(data, group) {
+  return Math.max(getGroupRequired(data, group, 'sat'), getGroupRequired(data, group, 'sun'));
+}
+
+/** 관리자/지게차 칸의 머리글 — 1칸이면 그룹 이름 그대로, 여러 칸이면 번호를 붙인다 */
+function groupHeaderLabels(label, cols) {
+  if (cols <= 1) return cols === 1 ? [label] : [];
+  return Array.from({ length: cols }, (_, i) => `${label}${i + 1}`);
+}
+
 /** "운영 2", "운영2부서" 같은 표기 흔들림을 "운영2"로 통일 */
 function normalizeDept(v) {
   return String(v == null ? '' : v).replace(/\s+/g, '').replace(/부서$/, '');
@@ -97,7 +122,7 @@ function normalizeDept(v) {
 const MOCK_DATA = {
   managers: {
     label: '관리자',
-    requiredPerDay: 1,
+    required: { sat: 1, sun: 1 },
     members: [
       { name: '이정명', count: 1, lastWorked: '2026-09-05' },
       { name: '김영민', count: 2, lastWorked: '2026-09-20' },
@@ -108,7 +133,7 @@ const MOCK_DATA = {
   },
   forklift: {
     label: '지게차',
-    requiredPerDay: 1,
+    required: { sat: 1, sun: 1 },
     members: [
       { name: '박인철', count: 1, lastWorked: '2026-09-05' },
       { name: '유기상', count: 2, lastWorked: '2026-09-27' },
@@ -392,7 +417,12 @@ function parseConfigNumber(v) {
  *  - 시트에 없는 부서/값은 FIELD_DEPT_DEFAULTS로 채운다
  */
 async function loadFieldConfig() {
-  const fallback = () => ({ byDept: copyFieldDeptDefaults(), legacyTotals: null, hasDeptRows: false });
+  const fallback = () => ({
+    byDept: copyFieldDeptDefaults(),
+    legacyTotals: null,
+    hasDeptRows: false,
+    groups: { managers: { ...DEFAULT_GROUP_REQUIRED }, forklift: { ...DEFAULT_GROUP_REQUIRED } },
+  });
   const url = CONFIG.fieldConfigCsv;
   if (!url || !url.startsWith('http')) return fallback();
   try {
@@ -406,7 +436,11 @@ async function loadFieldConfig() {
       if (!key) return;
       const required = parseConfigNumber(r['필요인원']);
       const dept = normalizeDept(r['부서']);
-      if (dept) {
+      const groupKey = CONFIG_GROUP_BY_LABEL[dept];
+      if (groupKey) {
+        // "지게차"/"관리자" 행은 부서가 아니라 그 그룹의 하루 필요인원이다
+        if (!Number.isNaN(required) && required >= 0) result.groups[groupKey][key === 'Sat' ? 'sat' : 'sun'] = Math.round(required);
+      } else if (dept) {
         result.hasDeptRows = true;
         if (!result.byDept[dept]) result.byDept[dept] = { ...ZERO_FIELD_CFG };
         if (!Number.isNaN(required)) result.byDept[dept][`required${key}`] = required;
@@ -474,8 +508,8 @@ async function loadData() {
   ]);
 
   const data = {
-    managers: { label: '관리자', requiredPerDay: 1, members: managersRows.map((r) => parseRosterRow(r)).filter((m) => m.name) },
-    forklift: { label: '지게차', requiredPerDay: 1, members: forkliftRows.map((r) => parseRosterRow(r)).filter((m) => m.name) },
+    managers: { label: '관리자', required: fieldConfig.groups.managers, members: managersRows.map((r) => parseRosterRow(r)).filter((m) => m.name) },
+    forklift: { label: '지게차', required: fieldConfig.groups.forklift, members: forkliftRows.map((r) => parseRosterRow(r)).filter((m) => m.name) },
     field: {
       label: '현장',
       byDept: fieldConfig.byDept,
@@ -637,8 +671,8 @@ function selectWithCapLadder(pool, needed, date, dow, hardExclude, tierExcludes,
   return { selected, owedSet: owed, shortfall: remaining };
 }
 
-function assignSingleSlot(members, date, dow, hardExclude, tierExcludes, owedSet) {
-  const { selected, owedSet: newOwed, shortfall } = selectWithCapLadder(members, 1, date, dow, hardExclude, tierExcludes, owedSet);
+function assignGroupDay(members, date, dow, needed, hardExclude, tierExcludes, owedSet) {
+  const { selected, owedSet: newOwed, shortfall } = selectWithCapLadder(members, needed, date, dow, hardExclude, tierExcludes, owedSet);
   return {
     picked: selected.map((m) => m.name),
     owedSet: newOwed,
@@ -852,14 +886,14 @@ function generateMonthSchedule(year, month, data, mode = currentMode) {
     const exFk = exclusionsFor('forklift');
     const exField = exclusionsFor('field');
 
-    const mgrResult = assignSingleSlot(workingMembers.managers, date, dow, exMgr.hard, exMgr.tiers, owed.managers);
+    const mgrResult = assignGroupDay(workingMembers.managers, date, dow, getGroupRequired(data, 'managers', dow), exMgr.hard, exMgr.tiers, owed.managers);
     entry.managers = mgrResult.picked;
     owed.managers = mgrResult.owedSet;
     if (mgrResult.shortfall) entry.warnings.push(`관리자 인원 부족 (${mgrResult.shortfall}명 미배정)`);
     stats.altTotal += mgrResult.altTotal;
     stats.altExceptions += mgrResult.altExceptions;
 
-    const fkResult = assignSingleSlot(workingMembers.forklift, date, dow, exFk.hard, exFk.tiers, owed.forklift);
+    const fkResult = assignGroupDay(workingMembers.forklift, date, dow, getGroupRequired(data, 'forklift', dow), exFk.hard, exFk.tiers, owed.forklift);
     entry.forklift = fkResult.picked;
     owed.forklift = fkResult.owedSet;
     if (fkResult.shortfall) entry.warnings.push(`지게차 인원 부족 (${fkResult.shortfall}명 미배정)`);
@@ -896,6 +930,11 @@ function generateMonthSchedule(year, month, data, mode = currentMode) {
   const knownLimited = (group) => Array.from(limited[group]).filter((n) => workingMembers[group].some((m) => m.name === n));
   return {
     days, owed, workingMembers, pools, mode, stats, year, month,
+    groupRequired: {
+      managers: { ...(data.managers.required || DEFAULT_GROUP_REQUIRED) },
+      forklift: { ...(data.forklift.required || DEFAULT_GROUP_REQUIRED) },
+    },
+    groupCols: { managers: getGroupCols(data, 'managers'), forklift: getGroupCols(data, 'forklift') },
     limited: { managers: knownLimited('managers'), forklift: knownLimited('forklift'), field: knownLimited('field') },
   };
 }
@@ -1020,9 +1059,14 @@ function renderSchedule(draft, data) {
   const pools = draft.pools;
   const multiPool = pools.length > 1;
   const fieldCols = pools.reduce((sum, p) => sum + p.cols, 0);
+  const gc = draft.groupCols || { managers: 1, forklift: 1 };
+  const gr = draft.groupRequired || { managers: DEFAULT_GROUP_REQUIRED, forklift: DEFAULT_GROUP_REQUIRED };
+  const totalCols = 1 + gc.managers + gc.forklift + fieldCols;
 
   let html = '<table class="schedule-table"><thead><tr>';
-  html += '<th>날짜</th><th>관리자</th><th>지게차</th>';
+  html += '<th>날짜</th>';
+  groupHeaderLabels('관리자', gc.managers).forEach((h) => { html += `<th>${h}</th>`; });
+  groupHeaderLabels('지게차', gc.forklift).forEach((h) => { html += `<th>${h}</th>`; });
   pools.forEach((p) => {
     for (let i = 0; i < p.cols; i++) html += `<th>${multiPool ? `${escapeHtml(p.dept)} ` : ''}현장${i + 1}</th>`;
   });
@@ -1054,10 +1098,15 @@ function renderSchedule(draft, data) {
     html += `<td class="${dateCellClass}">${formatKoreanDate(day.date)}(${weekdayLabel})</td>`;
 
     if (day.isHoliday) {
-      html += `<td colspan="${2 + fieldCols}" class="holiday-row-label">공휴일 휴무 (${escapeHtml(day.holidayLabel)})</td>`;
+      html += `<td colspan="${totalCols - 1}" class="holiday-row-label">공휴일 휴무 (${escapeHtml(day.holidayLabel)})</td>`;
     } else {
-      html += `<td>${renderSlotSelect(draft, dayIdx, 'managers', 0, data)}</td>`;
-      html += `<td>${renderSlotSelect(draft, dayIdx, 'forklift', 0, data)}</td>`;
+      ['managers', 'forklift'].forEach((g) => {
+        const required = day.dow === 'sat' ? gr[g].sat : gr[g].sun;
+        for (let i = 0; i < gc[g]; i++) {
+          if (i < day[g].length || i < required) html += `<td>${renderSlotSelect(draft, dayIdx, g, i, data)}</td>`;
+          else html += '<td>—</td>';
+        }
+      });
       pools.forEach((pool) => {
         const picks = day.fieldByDept[pool.key] || [];
         const required = day.dow === 'sat' ? pool.requiredSat : pool.requiredSun;
@@ -1073,7 +1122,7 @@ function renderSchedule(draft, data) {
     html += '</tr>';
 
     if (!day.isHoliday && (day.warnings.length || notes.length)) {
-      html += `<tr class="${rowClass}"><td></td><td colspan="${1 + fieldCols}">`;
+      html += `<tr class="${rowClass}"><td></td><td colspan="${totalCols - 1}">`;
       html += day.warnings.map((w) => `<span class="warn-tag">${escapeHtml(w)}</span>`).join(' ');
       html += notes.map((n) => `<span class="note-tag">${escapeHtml(n)}</span>`).join(' ');
       html += '</td></tr>';
@@ -1339,11 +1388,12 @@ async function onExport() {
 
     const pools = currentDraft.pools;
     const multiPool = pools.length > 1;
-    const fieldCols = pools.reduce((sum, p) => sum + p.cols, 0);
     const fieldHeaders = pools.flatMap((p) =>
       Array.from({ length: p.cols }, (_, i) => `${multiPool ? `${p.dept} ` : ''}현장${i + 1}`)
     );
-    const headers = ['날짜', '관리자', '지게차', ...fieldHeaders];
+    const gc = currentDraft.groupCols || { managers: 1, forklift: 1 };
+    const gr = currentDraft.groupRequired || { managers: DEFAULT_GROUP_REQUIRED, forklift: DEFAULT_GROUP_REQUIRED };
+    const headers = ['날짜', ...groupHeaderLabels('관리자', gc.managers), ...groupHeaderLabels('지게차', gc.forklift), ...fieldHeaders];
     sheet.addRow(headers);
 
     const thin = { style: 'thin', color: { argb: 'FFBFBFBF' } };
@@ -1360,9 +1410,11 @@ async function onExport() {
     currentDraft.days.forEach((day) => {
       const rowValues = [toExcelDate(day.date)];
       if (day.isHoliday) {
-        rowValues.push(`공휴일 휴무 (${day.holidayLabel})`, '', ...Array(fieldCols).fill(''));
+        rowValues.push(`공휴일 휴무 (${day.holidayLabel})`, ...Array(headers.length - 2).fill(''));
       } else {
-        rowValues.push(day.managers[0] || '', day.forklift[0] || '');
+        ['managers', 'forklift'].forEach((g) => {
+          for (let i = 0; i < gc[g]; i++) rowValues.push(day[g][i] || '');
+        });
         pools.forEach((p) => {
           const picks = day.fieldByDept[p.key] || [];
           for (let i = 0; i < p.cols; i++) rowValues.push(picks[i] || '');
@@ -1414,7 +1466,7 @@ function buildHandoutRows(draft, data) {
     if (day.isHoliday) return;
     const weekdayLabel = day.dow === 'sat' ? '토' : '일';
     const dateLabel = `${formatKoreanDate(day.date)}(${weekdayLabel})`;
-    if (day.forklift[0]) forkliftRows.push({ date: dateLabel, name: day.forklift[0] });
+    day.forklift.forEach((name) => { if (name) forkliftRows.push({ date: dateLabel, name }); });
     day.field.forEach((name) => {
       if (name && !fieldScheduleWorkerNames.has(name)) fieldRows.push({ date: dateLabel, name });
     });
@@ -1433,7 +1485,7 @@ function buildCalendarWeeks(year, month, draftByDate, data) {
     const isHoliday = data.holidays.has(iso);
     const names = [];
     if (entry && !entry.isHoliday) {
-      if (entry.forklift[0]) names.push(entry.forklift[0]);
+      entry.forklift.forEach((n) => { if (n) names.push(n); });
       entry.field.forEach((n) => { if (n) names.push(n); });
     }
     cells.push({
@@ -1458,9 +1510,12 @@ function buildAssignColumnHtml(rows) {
 function buildHandoutHtml(year, month, forkliftRows, fieldRows, weeks, scopeLabel) {
   const weekDayNames = ['일', '월', '화', '수', '목', '금', '토'];
 
-  // 지게차는 하루 1명뿐이라 표 하나로 충분하고, 현장은 인원이 많아서
-  // 한 페이지에 들어가도록 좌우 2단으로 나눠서 배치한다.
-  const forkliftTableHtml = buildAssignColumnHtml(forkliftRows);
+  // 지게차는 보통 표 하나로 충분하고, 현장은 인원이 많아서 한 페이지에 들어가도록
+  // 좌우 2단으로 나눠서 배치한다. 지게차도 행이 많아지면(하루 2명 이상 등) 똑같이 2단으로 나눈다.
+  const forkliftHalf = Math.ceil(forkliftRows.length / 2);
+  const forkliftTableHtml = forkliftRows.length > 10
+    ? `<div class="assign-columns">${buildAssignColumnHtml(forkliftRows.slice(0, forkliftHalf))}${buildAssignColumnHtml(forkliftRows.slice(forkliftHalf))}</div>`
+    : buildAssignColumnHtml(forkliftRows);
   const fieldHalf = Math.ceil(fieldRows.length / 2);
   const fieldColumnsHtml = `<div class="assign-columns">${buildAssignColumnHtml(fieldRows.slice(0, fieldHalf))}${buildAssignColumnHtml(fieldRows.slice(fieldHalf))}</div>`;
 
