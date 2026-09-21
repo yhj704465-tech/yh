@@ -20,7 +20,7 @@
  * fieldConfigCsv (선택) : 현장 토/일 필요인원을 시트에서 관리하고 싶을 때만 채우기
  *   - 요일 | 부서 | 필요인원   (요일: "토"/"일". 부서 열이 없는 옛 형식도 읽는다.
  *     예전에 쓰던 "최소FB" 열이 남아 있어도 무시한다)
- *   - 비워두면 운영1 토2/일1 + 운영2 토3/일2(합산 토5/일3)로 동작합니다.
+ *   - 비워두면 운영1 토1/일2 + 운영2 토2/일2로 동작합니다.
  * appsScriptUrl : Apps Script를 웹앱으로 배포한 .../exec 주소
  * ============================================================ */
 const CONFIG = {
@@ -59,12 +59,12 @@ function getScheduleWorkerNameSet(members) {
 
 /**
  * 현장 부서별 필요인원 기본값 — FieldConfig 시트에 부서 행이 없을 때만 쓰는 안전장치.
- * 풀필먼트2팀 합산 토5/일3 = 운영1 토2/일1 + 운영2 토3/일2. 고정근무자(차은미 등)는
- * 시트의 부서 칸에 적힌 부서의 인원수에 포함된다. 실제 값은 시트에서 관리한다.
+ * 고정근무자(차은미 등)는 시트의 부서 칸에 적힌 부서의 인원수에 포함된다.
+ * 실제 값은 시트에서 관리한다.
  */
 const FIELD_DEPT_DEFAULTS = {
-  '운영1': { requiredSat: 2, requiredSun: 1 },
-  '운영2': { requiredSat: 3, requiredSun: 2 },
+  '운영1': { requiredSat: 1, requiredSun: 2 },
+  '운영2': { requiredSat: 2, requiredSun: 2 },
 };
 const ZERO_FIELD_CFG = { requiredSat: 0, requiredSun: 0 };
 
@@ -398,7 +398,9 @@ function buildDataWarnings(data, info) {
       warnings.push(`부서가 비어 있어 배정에서 제외된 현장 인원 ${blank.length}명: ${blank.join(', ')} — Field 시트의 부서 칸을 채워주세요.`);
     }
     if (!info.configHasDeptRows) {
-      warnings.push('FieldConfig 시트에 "부서" 열이 없어 기본값(운영1 토2·일1 / 운영2 토3·일2)으로 배정합니다.');
+      const defaults = Object.entries(FIELD_DEPT_DEFAULTS)
+        .map(([dept, c]) => `${dept} 토${c.requiredSat}·일${c.requiredSun}`).join(' / ');
+      warnings.push(`FieldConfig 시트에 "부서" 열이 없어 기본값(${defaults})으로 배정합니다.`);
     }
   }
   return warnings;
@@ -449,11 +451,12 @@ async function loadData() {
 /* ============================================================
  * 배정 알고리즘
  *
- * 우선순위: 요일 교대(직전과 다른 요일 우선) → 누적횟수 오름차순 →
- *           최근근무일 오름차순(오래전 우선) → 지난 동률에서 밀린 이력(owed) 우선 →
- *           이름순(최종 결정론적 fallback)
+ * 우선순위: 누적횟수 오름차순 (요일 교대에 어긋나면 횟수를 +1로 셈) →
+ *           교대에 맞는 사람 → 최근근무일 오름차순(오래전 우선) →
+ *           지난 동률에서 밀린 이력(owed) 우선 → 이름순(최종 결정론적 fallback)
  *
- * 공평성이 최우선이다. FB 여부 같은 다른 조건으로 순위를 바꾸지 않는다.
+ * 공평성이 최우선이다. 요일 교대는 "누적횟수가 1회 이내로 비슷할 때" 순서를 정하는
+ * 데만 쓰이고, FB 여부 같은 다른 조건은 순위에 영향을 주지 않는다.
  * ============================================================ */
 function isEligible(member, date) {
   const dow = date.getDay();
@@ -475,38 +478,50 @@ function lastShiftDow(member) {
 /**
  * 요일 교대 규칙: 토요일에 일했으면 다음엔 일요일, 일요일에 일했으면 다음엔 토요일.
  * 직전 근무 요일은 시트의 최근근무일 날짜에서 계산한다.
- *   0 = 교대에 맞음(우선), 1 = 직전과 같은 요일이라 후순위
- * 절대 규칙이 아니라 "우선순위"다 — 현장은 토요일 자리가 일요일보다 많아서
- * (예: 토3·일2) 모두가 엄격히 교대하면 매 주말 토요일 후보가 1명씩 줄어 결국
- * 못 채운다. 그래서 교대에 맞는 사람을 먼저 뽑고, 모자라면 나머지에서 채운다.
- * 제외요일이 있는 사람(지게차 토/일 고정 인원, 일요일 불가 현장 인원 등)은 애초에
- * 교대할 수 없다. 이 사람들을 "교대 맞음(0)"으로 두면 교대가 횟수보다 앞서는 순위 때문에
- * 항상 남들보다 먼저 뽑혀 횟수가 크게 벌어진다(실데이터 6개월 시뮬레이션에서 다른 인원보다 +5회).
- * 그래서 "같은 요일 반복(1)"과 같은 취급을 하고, 교대 예외 통계에서는 뺀다.
+ *   0 = 교대에 맞음, 1 = 직전과 같은 요일이라 어긋남
+ *
+ * 절대 규칙도, 횟수보다 앞서는 규칙도 아니다. 교대에 어긋난 사람은 누적횟수를
+ * ALTERNATION_WEIGHT(=1)회 더 한 것처럼 취급해서 순위를 매긴다. 그래서 교대는
+ * 누적횟수가 1회 이내로 비슷한 사람들 사이에서만 순서를 정하고, 어떤 자리 구성
+ * (예: 토1·일2, 토2·일2)에서도 특정인이 계속 밀리거나 몰리지 않는다.
+ * (교대를 횟수보다 앞세우면 토·일 1자리씩일 때 제외요일자가 12개월간 한 번도 못 뽑혔다)
  */
+const ALTERNATION_WEIGHT = 1;
+
 function isAlternationExempt(member) {
   return !!(member.excludedWeekdays && member.excludedWeekdays.size);
 }
 
 function alternationClass(member, dow) {
   if (!dow) return 0;
-  if (isAlternationExempt(member)) return 1;
   return lastShiftDow(member) === dow ? 1 : 0;
 }
 
+/**
+ * 순위 계산에 더하는 "가상 횟수". 제외요일이 있는 사람(지게차 토/일 고정 인원,
+ * 일요일 불가 현장 인원 등)은 애초에 교대할 수 없으니 유리도 불리도 없게 중간값을 준다.
+ */
+function alternationPenalty(member, dow) {
+  if (isAlternationExempt(member)) return ALTERNATION_WEIGHT / 2;
+  return alternationClass(member, dow) * ALTERNATION_WEIGHT;
+}
+
 function tieKeyFor(dow) {
-  return (m) => `${alternationClass(m, dow)}|${m.count}|${m.lastWorked || ''}`;
+  return (m) => `${m.count + alternationPenalty(m, dow)}|${alternationPenalty(m, dow)}|${m.count}|${m.lastWorked || ''}`;
 }
 
 function rankCandidates(members, eligible, owedSet, dow) {
   const candidates = members.filter(eligible);
-  const cls = new Map(candidates.map((m) => [m.name, alternationClass(m, dow)]));
+  const penalty = new Map(candidates.map((m) => [m.name, alternationPenalty(m, dow)]));
   return candidates
     .slice()
     .sort((a, b) => {
-      const ca = cls.get(a.name);
-      const cb = cls.get(b.name);
-      if (ca !== cb) return ca - cb;
+      const pa = penalty.get(a.name);
+      const pb = penalty.get(b.name);
+      const scoreA = a.count + pa;
+      const scoreB = b.count + pb;
+      if (scoreA !== scoreB) return scoreA - scoreB;
+      if (pa !== pb) return pa - pb;
       if (a.count !== b.count) return a.count - b.count;
       const aLast = a.lastWorked || '';
       const bLast = b.lastWorked || '';
