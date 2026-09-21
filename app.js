@@ -369,6 +369,10 @@ function parseTieBreakRows(rows) {
       addMonthLimit(result.monthLimits, limit.ym, limit.group, name);
       return;
     }
+    if (String(r['그룹'] || '').trim().startsWith(LIMIT_ROW_PREFIX)) {
+      PARSE_WARNINGS.push(`TieBreakHistory의 "${String(r['그룹']).trim()}" 행을 읽을 수 없어 무시합니다 (예: ${LIMIT_ROW_PREFIX} 2026-11 지게차 — 그룹은 관리자/지게차/현장).`);
+      return;
+    }
     const group = mapGroupLabelToKey(r['그룹']);
     if (group) result[group].push(name);
   });
@@ -422,6 +426,15 @@ async function loadFieldConfig() {
 /** 시트 상태를 보고 사용자에게 알려야 할 문제를 문장으로 만든다 (화면 경고 배너용) */
 function buildDataWarnings(data, info) {
   const warnings = [...PARSE_WARNINGS];
+  Object.entries((data.tieBreakHistory && data.tieBreakHistory.monthLimits) || {}).forEach(([ym, groups]) => {
+    LIMIT_GROUPS.forEach((g) => {
+      const known = new Set(data[g].members.map((m) => m.name));
+      const unknown = (groups[g] || []).filter((n) => !known.has(n));
+      if (unknown.length) {
+        warnings.push(`TieBreakHistory의 ${ym} ${LIMIT_GROUP_LABELS[g]} 1회제한 명단에 시트에 없는 이름이 있어 무시합니다: ${unknown.join(', ')}`);
+      }
+    });
+  });
   const members = data.field.members;
   if (!info.fieldHasDeptColumn) {
     warnings.push('Field 시트에 "부서" 컬럼이 없어 현장 인원 전체를 한 팀으로 보고 배정합니다 (운영1/운영2 구분 없음).');
@@ -486,11 +499,11 @@ async function loadData() {
 /* ============================================================
  * 배정 알고리즘
  *
- * 우선순위: 누적횟수 오름차순 (요일 교대에 어긋나면 횟수를 +1로 셈) →
+ * 우선순위: 누적횟수 오름차순 (요일 교대에 어긋나면 횟수를 +2로 셈) →
  *           교대에 맞는 사람 → 최근근무일 오름차순(오래전 우선) →
  *           지난 동률에서 밀린 이력(owed) 우선 → 이름순(최종 결정론적 fallback)
  *
- * 공평성이 최우선이다. 요일 교대는 "누적횟수가 1회 이내로 비슷할 때" 순서를 정하는
+ * 공평성이 최우선이다. 요일 교대는 "누적횟수가 2회 이내로 비슷할 때" 순서를 정하는
  * 데만 쓰이고, FB 여부 같은 다른 조건은 순위에 영향을 주지 않는다.
  * ============================================================ */
 function isEligible(member, date) {
@@ -516,12 +529,12 @@ function lastShiftDow(member) {
  *   0 = 교대에 맞음, 1 = 직전과 같은 요일이라 어긋남
  *
  * 절대 규칙도, 횟수보다 앞서는 규칙도 아니다. 교대에 어긋난 사람은 누적횟수를
- * ALTERNATION_WEIGHT(=1)회 더 한 것처럼 취급해서 순위를 매긴다. 그래서 교대는
- * 누적횟수가 1회 이내로 비슷한 사람들 사이에서만 순서를 정하고, 어떤 자리 구성
+ * ALTERNATION_WEIGHT(=2)회 더 한 것처럼 취급해서 순위를 매긴다. 그래서 교대는
+ * 누적횟수가 2회 이내로 비슷한 사람들 사이에서만 순서를 정하고, 어떤 자리 구성
  * (예: 토1·일2, 토2·일2)에서도 특정인이 계속 밀리거나 몰리지 않는다.
  * (교대를 횟수보다 앞세우면 토·일 1자리씩일 때 제외요일자가 12개월간 한 번도 못 뽑혔다)
  */
-const ALTERNATION_WEIGHT = 1;
+const ALTERNATION_WEIGHT = 2;
 
 function isAlternationExempt(member) {
   return !!(member.excludedWeekdays && member.excludedWeekdays.size);
@@ -879,10 +892,11 @@ function generateMonthSchedule(year, month, data, mode = currentMode) {
     days.push(entry);
   }
 
-  const toNames = (set) => Array.from(set);
+  // 시트에 없는 이름은 제외하고 화면에 알릴 제한 대상만 남긴다 (오타는 시트 확인 배너로 따로 알려준다)
+  const knownLimited = (group) => Array.from(limited[group]).filter((n) => workingMembers[group].some((m) => m.name === n));
   return {
     days, owed, workingMembers, pools, mode, stats, year, month,
-    limited: { managers: toNames(limited.managers), forklift: toNames(limited.forklift), field: toNames(limited.field) },
+    limited: { managers: knownLimited('managers'), forklift: knownLimited('forklift'), field: knownLimited('field') },
   };
 }
 
@@ -1112,6 +1126,9 @@ function renderRosterStatus(data) {
   const pools = getFieldPools(data, currentMode);
   const fieldScopeMembers = data.field.members.filter((m) => pools.some((p) => poolIncludes(p, m)));
   const showDeptTag = pools.length > 1;
+  // 선택한 연·월에 "지난달 3회 근무로 1회만 배정"되는 사람 표시
+  const limitsThisMonth = (data.tieBreakHistory.monthLimits || {})[ymKey(Number(yearSelectEl.value), Number(monthSelectEl.value))] || {};
+  const limitTag = (groupKey, name) => ((limitsThisMonth[groupKey] || []).includes(name) ? '<span class="limit-tag">1회 제한</span>' : '');
   const scopeSuffix = pools.length === 1 && pools[0].dept ? ` · ${pools[0].dept}` : '';
   const fieldScheduleWorkerNames = getScheduleWorkers(fieldScopeMembers).map((m) => m.name);
   const fieldTitle = fieldScheduleWorkerNames.length
@@ -1133,7 +1150,7 @@ function renderRosterStatus(data) {
         .map(
           (m) => `
         <tr>
-          <td>${escapeHtml(m.name)}${g.key === 'field' && m.fb ? '<span class="fb-tag">FB</span>' : ''}${g.key === 'field' && showDeptTag && m.dept ? `<span class="dept-tag">${escapeHtml(m.dept)}</span>` : ''}</td>
+          <td>${escapeHtml(m.name)}${limitTag(g.key, m.name)}${g.key === 'field' && m.fb ? '<span class="fb-tag">FB</span>' : ''}${g.key === 'field' && showDeptTag && m.dept ? `<span class="dept-tag">${escapeHtml(m.dept)}</span>` : ''}</td>
           <td class="num">${m.count}</td>
           <td>${m.lastWorked || '-'}</td>
         </tr>`
@@ -1579,7 +1596,7 @@ function onGenerate() {
     ((tallies[g].get(n) || 0) >= LIMITED_MONTH_MAX_CAP ? limitedTwice : limitedOnce).push(label);
   }));
   const capMsg = (maxedText ? ` 인원이 모자라 월 ${MONTHLY_MAX_CAP}회 근무가 된 사람: ${maxedText} — 저장하면 다음 달엔 1회만 배정됩니다.` : '')
-    + (limitedOnce.length ? ` 지난달 ${MONTHLY_MAX_CAP}회 근무로 이번 달 1회만 배정한 사람: ${limitedOnce.join(', ')}.` : '')
+    + (limitedOnce.length ? ` 지난달 ${MONTHLY_MAX_CAP}회 근무로 이번 달 1회까지만 배정한 사람: ${limitedOnce.join(', ')}.` : '')
     + (limitedTwice.length ? ` 지난달 ${MONTHLY_MAX_CAP}회 근무했지만 인원이 안 맞아 이번 달 2회 배정된 사람: ${limitedTwice.join(', ')}.` : '');
   const altMsg = altExceptions
     ? ` 요일 교대 예외 ${altExceptions}/${altTotal}건 (인원이 모자라 같은 요일을 연속 배정).`
@@ -1621,8 +1638,12 @@ document.getElementById('btnGenerate').addEventListener('click', onGenerate);
 document.getElementById('btnCommit').addEventListener('click', onCommit);
 document.getElementById('btnExport').addEventListener('click', onExport);
 document.getElementById('btnHandout').addEventListener('click', onHandoutDownload);
-yearSelectEl.addEventListener('change', () => resetDraftUi());
-monthSelectEl.addEventListener('change', () => resetDraftUi());
+function onPeriodChange() {
+  resetDraftUi();
+  if (DATA) renderRosterStatus(DATA); // 월이 바뀌면 "1회 제한" 표시도 그 달 기준으로 바뀐다
+}
+yearSelectEl.addEventListener('change', onPeriodChange);
+monthSelectEl.addEventListener('change', onPeriodChange);
 initModeSwitch();
 
 /* ============================================================
