@@ -47,6 +47,8 @@
   app.js 상단 CONFIG 값을 채우면 실제 시트 데이터로 전환됩니다.
 </div>
 
+<div id="dataWarnings" class="banner banner-warn" role="alert" hidden></div>
+
 <main>
   <section class="panel controls">
     <div class="control-group">
@@ -56,6 +58,7 @@
       <select id="monthSelect"></select>
     </div>
     <div class="control-group control-actions">
+      <div id="modeSwitch" class="mode-switch" role="group" aria-label="배정 범위"></div>
       <button id="btnReload" class="btn btn-ghost" type="button">데이터 새로고침</button>
       <button id="btnGenerate" class="btn btn-primary" type="button">자동배정 생성</button>
       <button id="btnCommit" class="btn btn-confirm" type="button" disabled>확정 저장</button>

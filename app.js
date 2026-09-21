@@ -7,9 +7,12 @@
  * csv.* : 각 시트를 "파일 > 공유 > 웹에 게시"로 CSV 게시한 URL
  *   - managers : 이름 | 급여형태 | 입사일 | 누적횟수 | 최근근무일 | 제외요일
  *   - forklift : 이름 | 급여형태 | 입사일 | 누적횟수 | 최근근무일 | 제외요일
- *   - field    : 이름 | 소속 | FB | 입사일 | 누적횟수 | 최근근무일 | 제외요일 | 고정근무
+ *   - field    : 이름 | 소속 | FB | 입사일 | 누적횟수 | 최근근무일 | 제외요일 | 고정근무 | 부서
  *              (FB, 고정근무 컬럼: TRUE/FALSE. 고정근무=TRUE인 사람은 매주 토·일 자동 근무
  *               처리되고 로테이션 카운트에서 빠진다 — 차은미 같은 스케줄근무자용. 없으면 전부 FALSE)
+ *              (부서 컬럼: 운영1 / 운영2. 현장 인원을 부서별로 나눠 배정한다. 관리자·지게차는
+ *               부서 구분 없이 전원이 대상이라 부서 컬럼이 있어도 무시한다.
+ *               모드 버튼: 풀필먼트2팀 = 두 부서 합산, 운영2 = 운영2 인원만)
  *   ※ 제외요일 : "일요일" / "토요일" 처럼 그 사람을 절대 배정하면 안 되는 요일. 없으면 빈칸.
  *              여러 개면 "토요일,일요일"처럼 쉼표로 구분.
  *   - tieBreakHistory : 그룹 | 이름
@@ -53,6 +56,39 @@ function getScheduleWorkerNameSet(members) {
   return new Set(getScheduleWorkers(members).map((m) => m.name));
 }
 
+/**
+ * 현장 부서별 필요인원 기본값 — FieldConfig 시트에 부서 행이 없을 때만 쓰는 안전장치.
+ * 풀필먼트2팀 합산 토5/일3 = 운영1 토2/일1 + 운영2 토3/일2. 고정근무자(차은미 등)는
+ * 시트의 부서 칸에 적힌 부서의 인원수에 포함된다. 실제 값은 시트에서 관리한다.
+ */
+const FIELD_DEPT_DEFAULTS = {
+  '운영1': { requiredSat: 2, requiredSun: 1, minFbSat: 1, minFbSun: 1 },
+  '운영2': { requiredSat: 3, requiredSun: 2, minFbSat: 1, minFbSun: 1 },
+};
+const ZERO_FIELD_CFG = { requiredSat: 0, requiredSun: 0, minFbSat: 0, minFbSun: 0 };
+
+function copyFieldDeptDefaults() {
+  const out = {};
+  Object.entries(FIELD_DEPT_DEFAULTS).forEach(([dept, cfg]) => { out[dept] = { ...cfg }; });
+  return out;
+}
+
+/** 부서 구분이 없는 옛 방식(전체 한 팀)일 때 쓸 합계 — 부서별 값을 모두 더한다 */
+function sumFieldTotals(byDept) {
+  const vals = Object.values(byDept);
+  return {
+    requiredSat: vals.reduce((a, v) => a + v.requiredSat, 0),
+    requiredSun: vals.reduce((a, v) => a + v.requiredSun, 0),
+    minFbSat: vals.reduce((a, v) => Math.max(a, v.minFbSat), 0),
+    minFbSun: vals.reduce((a, v) => Math.max(a, v.minFbSun), 0),
+  };
+}
+
+/** "운영 2", "운영2부서" 같은 표기 흔들림을 "운영2"로 통일 */
+function normalizeDept(v) {
+  return String(v == null ? '' : v).replace(/\s+/g, '').replace(/부서$/, '');
+}
+
 /* ============================================================
  * MOCK DATA — Google Sheets 연동 전 화면/알고리즘 검증용 초기 데이터.
  * 2026년 9월 실적 기준 실제 명단입니다 (급여형태/소속 라벨은 Google Sheets
@@ -90,10 +126,9 @@ const MOCK_DATA = {
   },
   field: {
     label: '현장',
-    requiredSat: 4,
-    requiredSun: 2,
-    minFbSat: 1,
-    minFbSun: 1,
+    // 목업 명단에는 부서 정보가 없어서 부서 구분 없이 한 팀으로 동작한다 (옛 방식)
+    legacyTotals: { requiredSat: 4, requiredSun: 2, minFbSat: 1, minFbSun: 1 },
+    byDept: FIELD_DEPT_DEFAULTS,
     members: [
       { name: '진영미', fb: true, count: 1, lastWorked: '2026-09-05' },
       { name: '박준호', fb: false, count: 1, lastWorked: '2026-09-05' },
@@ -143,6 +178,7 @@ function cloneMockData() {
       field: [...MOCK_DATA.tieBreakHistory.field],
     },
     holidays: new Map(MOCK_DATA.holidays),
+    warnings: [],
   };
 }
 
@@ -200,14 +236,40 @@ function getWeekendDatesInMonth(year, month) {
   return result;
 }
 
-function normalizeDateString(v) {
-  if (!v) return '';
+// 시트를 읽는 동안 발견한 문제(읽을 수 없는 날짜 등)를 모아서 화면 경고로 보여준다.
+let PARSE_WARNINGS = [];
+
+/**
+ * 시트에 사람이 손으로 친 날짜를 YYYY-MM-DD로 통일한다.
+ * YYYY-MM-DD, YYYY.M.D, YYYY/M/D, YYYYMMDD, YYMMDD(261011 → 2026-10-11)를 읽고,
+ * 그 외 형식은 Date 파싱을 시도하되 2000~2100년을 벗어나면 잘못된 값으로 본다
+ * (예전엔 "261011"을 26만년으로 읽어서 그 사람이 영원히 배정 불가가 됐다).
+ */
+function normalizeDateString(v, label) {
+  if (v === undefined || v === null) return '';
   const s = String(v).trim();
   if (!s) return '';
   if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
-  const d = new Date(s);
-  if (isNaN(d.getTime())) return '';
-  return toISODate(d);
+
+  let ymd = null;
+  let match = s.match(/^(\d{4})[.\-/]\s*(\d{1,2})[.\-/]\s*(\d{1,2})\.?$/);
+  if (match) ymd = [match[1], match[2], match[3]];
+  if (!ymd && (match = s.match(/^(\d{4})(\d{2})(\d{2})$/))) ymd = [match[1], match[2], match[3]];
+  if (!ymd && (match = s.match(/^(\d{2})(\d{2})(\d{2})$/))) ymd = [`20${match[1]}`, match[2], match[3]];
+  if (ymd) {
+    const [y, m, d] = ymd.map(Number);
+    const date = new Date(y, m - 1, d);
+    if (date.getFullYear() === y && date.getMonth() === m - 1 && date.getDate() === d) {
+      return `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+    }
+  }
+
+  const parsed = new Date(s);
+  if (!isNaN(parsed.getTime()) && parsed.getFullYear() >= 2000 && parsed.getFullYear() <= 2100) {
+    return toISODate(parsed);
+  }
+  if (label) PARSE_WARNINGS.push(`${label}: "${s}" 날짜를 읽을 수 없어 무시합니다 (YYYY-MM-DD 형식으로 입력해주세요)`);
+  return '';
 }
 
 function escapeHtml(s) {
@@ -239,12 +301,14 @@ function parseExcludedWeekdays(v) {
 }
 
 function parseRosterRow(row) {
+  const name = (row['이름'] || '').trim();
   return {
-    name: (row['이름'] || '').trim(),
+    name,
     count: Number(row['누적횟수'] || 0),
-    lastWorked: normalizeDateString(row['최근근무일']),
-    joinDate: normalizeDateString(row['입사일']) || null,
+    lastWorked: normalizeDateString(row['최근근무일'], name && `${name} 최근근무일`),
+    joinDate: normalizeDateString(row['입사일'], name && `${name} 입사일`) || null,
     excludedWeekdays: parseExcludedWeekdays(row['제외요일']),
+    dept: normalizeDept(row['부서']),
   };
 }
 
@@ -277,28 +341,71 @@ function parseTieBreakRows(rows) {
   return result;
 }
 
-const FIELD_CONFIG_DEFAULTS = { requiredSat: 4, requiredSun: 2, minFbSat: 1, minFbSun: 1 };
+/** 빈 칸은 "값 없음"으로 본다 (Number('')는 0이라서 그대로 쓰면 빈 칸이 0명이 된다) */
+function parseConfigNumber(v) {
+  const s = String(v == null ? '' : v).trim();
+  return s === '' ? NaN : Number(s);
+}
 
+/**
+ * FieldConfig 시트: 요일 | 부서 | 필요인원 | 최소FB
+ *  - 부서 칸이 있는 행 → 그 부서의 요일별 필요인원/최소FB (byDept)
+ *  - 부서 칸이 없는 옛 형식 행 → 부서 구분 없이 전체 한 팀일 때 쓰는 합계 (legacyTotals)
+ *  - 시트에 없는 부서/값은 FIELD_DEPT_DEFAULTS로 채운다
+ */
 async function loadFieldConfig() {
+  const fallback = () => ({ byDept: copyFieldDeptDefaults(), legacyTotals: null, hasDeptRows: false });
   const url = CONFIG.fieldConfigCsv;
-  if (!url || !url.startsWith('http')) return { ...FIELD_CONFIG_DEFAULTS };
+  if (!url || !url.startsWith('http')) return fallback();
   try {
     const rows = await fetchCsv(url, `cachebust=${Date.now()}`);
-    const result = { ...FIELD_CONFIG_DEFAULTS };
+    const result = fallback();
+    const legacy = sumFieldTotals(result.byDept);
+    let sawLegacy = false;
     rows.forEach((r) => {
       const day = (r['요일'] || '').trim();
-      const required = Number(r['필요인원']);
-      const minFb = Number(r['최소FB']);
       const key = day.startsWith('토') ? 'Sat' : day.startsWith('일') ? 'Sun' : null;
       if (!key) return;
-      if (!Number.isNaN(required)) result[`required${key}`] = required;
-      if (!Number.isNaN(minFb)) result[`minFb${key}`] = minFb;
+      const required = parseConfigNumber(r['필요인원']);
+      const minFb = parseConfigNumber(r['최소FB']);
+      const dept = normalizeDept(r['부서']);
+      if (dept) {
+        result.hasDeptRows = true;
+        if (!result.byDept[dept]) result.byDept[dept] = { ...ZERO_FIELD_CFG, minFbSat: 1, minFbSun: 1 };
+        if (!Number.isNaN(required)) result.byDept[dept][`required${key}`] = required;
+        if (!Number.isNaN(minFb)) result.byDept[dept][`minFb${key}`] = minFb;
+      } else {
+        sawLegacy = true;
+        if (!Number.isNaN(required)) legacy[`required${key}`] = required;
+        if (!Number.isNaN(minFb)) legacy[`minFb${key}`] = minFb;
+      }
     });
+    result.legacyTotals = sawLegacy ? legacy : null;
     return result;
   } catch (err) {
-    console.warn('FieldConfig 로드 실패, 기본값(토4/일2/FB1)으로 동작합니다:', err);
-    return { ...FIELD_CONFIG_DEFAULTS };
+    console.warn('FieldConfig 로드 실패, 기본값으로 동작합니다:', err);
+    return fallback();
   }
+}
+
+/** 시트 상태를 보고 사용자에게 알려야 할 문제를 문장으로 만든다 (화면 경고 배너용) */
+function buildDataWarnings(data, info) {
+  const warnings = [...PARSE_WARNINGS];
+  const members = data.field.members;
+  if (!info.fieldHasDeptColumn) {
+    warnings.push('Field 시트에 "부서" 컬럼이 없어 현장 인원 전체를 한 팀으로 보고 배정합니다 (운영1/운영2 구분 없음).');
+  } else if (!members.some((m) => m.dept)) {
+    warnings.push('Field 시트의 "부서" 칸이 모두 비어 있어 현장 인원 전체를 한 팀으로 보고 배정합니다.');
+  } else {
+    const blank = members.filter((m) => !m.dept).map((m) => m.name);
+    if (blank.length) {
+      warnings.push(`부서가 비어 있어 배정에서 제외된 현장 인원 ${blank.length}명: ${blank.join(', ')} — Field 시트의 부서 칸을 채워주세요.`);
+    }
+    if (!info.configHasDeptRows) {
+      warnings.push('FieldConfig 시트에 "부서" 열이 없어 기본값(운영1 토2·일1 / 운영2 토3·일2)으로 배정합니다.');
+    }
+  }
+  return warnings;
 }
 
 async function loadData() {
@@ -310,6 +417,7 @@ async function loadData() {
   banner.hidden = true;
 
   const bust = `cachebust=${Date.now()}`;
+  PARSE_WARNINGS = [];
   const [managersRows, forkliftRows, fieldRows, tieRows, holidayRows, fieldConfig] = await Promise.all([
     fetchCsv(CONFIG.csv.managers, bust),
     fetchCsv(CONFIG.csv.forklift, bust),
@@ -319,24 +427,27 @@ async function loadData() {
     loadFieldConfig(),
   ]);
 
-  return {
-    managers: { label: '관리자', requiredPerDay: 1, members: managersRows.map(parseRosterRow).filter((m) => m.name) },
-    forklift: { label: '지게차', requiredPerDay: 1, members: forkliftRows.map(parseRosterRow).filter((m) => m.name) },
+  const data = {
+    managers: { label: '관리자', requiredPerDay: 1, members: managersRows.map((r) => parseRosterRow(r)).filter((m) => m.name) },
+    forklift: { label: '지게차', requiredPerDay: 1, members: forkliftRows.map((r) => parseRosterRow(r)).filter((m) => m.name) },
     field: {
       label: '현장',
-      requiredSat: fieldConfig.requiredSat,
-      requiredSun: fieldConfig.requiredSun,
-      minFbSat: fieldConfig.minFbSat,
-      minFbSun: fieldConfig.minFbSun,
-      members: fieldRows.map(parseFieldRow).filter((m) => m.name),
+      byDept: fieldConfig.byDept,
+      legacyTotals: fieldConfig.legacyTotals,
+      members: fieldRows.map((r) => parseFieldRow(r)).filter((m) => m.name),
     },
     tieBreakHistory: parseTieBreakRows(tieRows),
     holidays: new Map(
       holidayRows
-        .map((r) => [normalizeDateString(r['날짜']), (r['설명'] || '공휴일').trim()])
+        .map((r) => [normalizeDateString(r['날짜'], '공휴일 목록'), (r['설명'] || '공휴일').trim()])
         .filter(([iso]) => iso)
     ),
   };
+  data.warnings = buildDataWarnings(data, {
+    fieldHasDeptColumn: fieldRows.length > 0 && '부서' in fieldRows[0],
+    configHasDeptRows: fieldConfig.hasDeptRows,
+  });
+  return data;
 }
 
 /* ============================================================
@@ -362,11 +473,40 @@ function isEligible(member, date) {
   return true;
 }
 
-function rankCandidates(members, eligible, owedSet) {
-  return members
-    .filter(eligible)
+function lastShiftDow(member) {
+  if (!member.lastWorked) return null;
+  const day = parseISODate(member.lastWorked).getDay();
+  return day === 6 ? 'sat' : day === 0 ? 'sun' : null;
+}
+
+/**
+ * 요일 교대 규칙: 토요일에 일했으면 다음엔 일요일, 일요일에 일했으면 다음엔 토요일.
+ * 직전 근무 요일은 시트의 최근근무일 날짜에서 계산한다.
+ *   0 = 교대에 맞음(우선), 1 = 직전과 같은 요일이라 후순위
+ * 절대 규칙이 아니라 "우선순위"다 — 현장은 토요일 자리가 일요일보다 많아서
+ * (예: 토3·일2) 모두가 엄격히 교대하면 매 주말 토요일 후보가 1명씩 줄어 결국
+ * 못 채운다. 그래서 교대에 맞는 사람을 먼저 뽑고, 모자라면 나머지에서 채운다.
+ * 제외요일이 있는 사람(지게차 토/일 고정 인원 등)은 애초에 교대할 수 없어서 대상에서 뺀다.
+ */
+function alternationClass(member, dow) {
+  if (!dow) return 0;
+  if (member.excludedWeekdays && member.excludedWeekdays.size) return 0;
+  return lastShiftDow(member) === dow ? 1 : 0;
+}
+
+function tieKeyFor(dow) {
+  return (m) => `${alternationClass(m, dow)}|${m.count}|${m.lastWorked || ''}`;
+}
+
+function rankCandidates(members, eligible, owedSet, dow) {
+  const candidates = members.filter(eligible);
+  const cls = new Map(candidates.map((m) => [m.name, alternationClass(m, dow)]));
+  return candidates
     .slice()
     .sort((a, b) => {
+      const ca = cls.get(a.name);
+      const cb = cls.get(b.name);
+      if (ca !== cb) return ca - cb;
       if (a.count !== b.count) return a.count - b.count;
       const aLast = a.lastWorked || '';
       const bLast = b.lastWorked || '';
@@ -378,7 +518,8 @@ function rankCandidates(members, eligible, owedSet) {
     });
 }
 
-function selectTopWithTieBreak(ranked, k, owedSet) {
+function selectTopWithTieBreak(ranked, k, owedSet, keyOf) {
+  const key = keyOf || ((m) => `${m.count}|${m.lastWorked || ''}`);
   const nextOwed = new Set(owedSet);
   if (k <= 0) return { selected: [], owedSet: nextOwed, shortfall: 0 };
   if (ranked.length <= k) {
@@ -387,7 +528,6 @@ function selectTopWithTieBreak(ranked, k, owedSet) {
   }
   const selected = ranked.slice(0, k);
   const rest = ranked.slice(k);
-  const key = (m) => `${m.count}|${m.lastWorked || ''}`;
   const boundaryKey = key(selected[k - 1]);
   const tiedSelected = selected.filter((m) => key(m) === boundaryKey);
   const tiedRest = rest.filter((m) => key(m) === boundaryKey);
@@ -398,20 +538,30 @@ function selectTopWithTieBreak(ranked, k, owedSet) {
   return { selected, owedSet: nextOwed, shortfall: 0 };
 }
 
-function assignSingleSlot(members, date, excludeNames, owedSet) {
-  const eligible = (m) => isEligible(m, date) && !excludeNames.has(m.name);
-  const ranked = rankCandidates(members, eligible, owedSet);
-  const { selected, owedSet: newOwed, shortfall } = selectTopWithTieBreak(ranked, 1, owedSet);
-  return { picked: selected.map((m) => m.name), owedSet: newOwed, shortfall };
+function countAlternationExceptions(selected, dow) {
+  return selected.filter((m) => alternationClass(m, dow) === 1).length;
 }
 
-function assignFieldDay(members, minFbPerDay, date, requiredTotal, excludeNames, owedSet) {
+function assignSingleSlot(members, date, dow, excludeNames, owedSet) {
+  const eligible = (m) => isEligible(m, date) && !excludeNames.has(m.name);
+  const ranked = rankCandidates(members, eligible, owedSet, dow);
+  const { selected, owedSet: newOwed, shortfall } = selectTopWithTieBreak(ranked, 1, owedSet, tieKeyFor(dow));
+  return {
+    picked: selected.map((m) => m.name),
+    owedSet: newOwed,
+    shortfall,
+    altTotal: selected.length,
+    altExceptions: countAlternationExceptions(selected, dow),
+  };
+}
+
+function assignFieldDay(members, minFbPerDay, date, dow, requiredTotal, excludeNames, owedSet, label) {
   const scheduleWorkers = getScheduleWorkers(members); // 고정근무자는 로테이션 대상 아님, 매일 자동 포함
   const rotationPool = members.filter((m) => !m.scheduleWorker);
   const rotationNeeded = Math.max(0, requiredTotal - scheduleWorkers.length);
   const eligible = (m) => isEligible(m, date) && !excludeNames.has(m.name);
-  const ranked = rankCandidates(rotationPool, eligible, owedSet);
-  let { selected, owedSet: newOwed, shortfall } = selectTopWithTieBreak(ranked, rotationNeeded, owedSet);
+  const ranked = rankCandidates(rotationPool, eligible, owedSet, dow);
+  let { selected, owedSet: newOwed, shortfall } = selectTopWithTieBreak(ranked, rotationNeeded, owedSet, tieKeyFor(dow));
 
   const warnings = [];
   const fbCount = scheduleWorkers.filter((m) => m.fb).length + selected.filter((m) => m.fb).length;
@@ -427,16 +577,18 @@ function assignFieldDay(members, minFbPerDay, date, requiredTotal, excludeNames,
       if (removeIdx >= 0) selected.splice(removeIdx, 1, bestFbOutside);
       else selected.push(bestFbOutside);
     } else {
-      warnings.push('FB(월급제·시급제) 인원이 부족해 최소 1명 조건을 채우지 못했습니다.');
+      warnings.push(`${label} FB(월급제·시급제) 인원이 부족해 최소 ${minFbPerDay}명 조건을 채우지 못했습니다.`);
     }
   }
 
-  if (shortfall) warnings.push(`현장 인원 부족 (${shortfall}명 미배정)`);
+  if (shortfall) warnings.push(`${label} 인원 부족 (${shortfall}명 미배정)`);
 
   return {
     picked: [...scheduleWorkers.map((m) => m.name), ...selected.map((m) => m.name)],
     owedSet: newOwed,
     warnings,
+    altTotal: selected.length,
+    altExceptions: countAlternationExceptions(selected, dow),
   };
 }
 
@@ -505,7 +657,48 @@ function bumpMonthlyPicks(monthlyMap, names, skipNames) {
   });
 }
 
-function generateMonthSchedule(year, month, data) {
+/* ------------------------------------------------------------
+ * 부서 풀 — 현장 인원을 부서(운영1/운영2)별로 나눠 각자 자기 인원수만큼 배정한다.
+ * 모드: 'all' = 풀필먼트2팀(모든 부서 합산), '운영2' = 그 부서 인원만.
+ * Field 시트에 부서 구분이 없으면(옛 방식) 전체를 하나의 풀로 취급한다.
+ * ------------------------------------------------------------ */
+const MODE_BUTTONS = [
+  { key: 'all', label: '풀필먼트2팀' },
+  { key: '운영2', label: '운영2' },
+];
+const DEFAULT_MODE = '운영2';
+
+function getModeLabel(mode) {
+  const found = MODE_BUTTONS.find((b) => b.key === mode);
+  return found ? found.label : mode;
+}
+
+function isDeptAware(data) {
+  return data.field.members.some((m) => m.dept);
+}
+
+function poolIncludes(pool, member) {
+  return pool.dept === null || member.dept === pool.dept;
+}
+
+function getFieldPools(data, mode) {
+  const f = data.field;
+  const withCols = (p) => ({ ...p, cols: Math.max(p.requiredSat, p.requiredSun) });
+  if (!isDeptAware(data)) {
+    const totals = f.legacyTotals || sumFieldTotals(f.byDept);
+    return [withCols({ key: '', dept: null, ...totals })];
+  }
+  const allDepts = Object.keys(f.byDept).sort((a, b) => a.localeCompare(b, 'ko'));
+  const depts = mode === 'all' ? allDepts : [mode];
+  return depts.map((d) => withCols({ key: d, dept: d, ...(f.byDept[d] || ZERO_FIELD_CFG) }));
+}
+
+/** entry.fieldByDept(부서별 배정)를 이어 붙여 entry.field(평평한 이름 목록)를 다시 만든다 */
+function syncFlatField(entry, pools) {
+  entry.field = pools.flatMap((p) => entry.fieldByDept[p.key] || []);
+}
+
+function generateMonthSchedule(year, month, data, mode = currentMode) {
   const dates = getWeekendDatesInMonth(year, month);
   const workingMembers = {
     managers: cloneMembers(data.managers.members),
@@ -521,6 +714,8 @@ function generateMonthSchedule(year, month, data) {
   // 고정근무자는 상한 대상이 아니라서 애초에 여기 안 쌓는다.
   const monthlyPicks = { managers: new Map(), forklift: new Map(), field: new Map() };
   const fieldScheduleWorkerNames = getScheduleWorkerNameSet(data.field.members);
+  const pools = getFieldPools(data, mode);
+  const stats = { altTotal: 0, altExceptions: 0 }; // 요일 교대 규칙을 지킨 건수/예외 건수
 
   const days = [];
 
@@ -535,6 +730,7 @@ function generateMonthSchedule(year, month, data) {
       managers: [],
       forklift: [],
       field: [],
+      fieldByDept: {},
       warnings: [],
     };
 
@@ -557,24 +753,35 @@ function generateMonthSchedule(year, month, data) {
       ...namesAtMonthlyCap(monthlyPicks.field, 'field', workingMembers.field, year, month),
     ]);
 
-    const mgrResult = assignSingleSlot(workingMembers.managers, date, excludeManagers, owed.managers);
+    const mgrResult = assignSingleSlot(workingMembers.managers, date, dow, excludeManagers, owed.managers);
     entry.managers = mgrResult.picked;
     owed.managers = mgrResult.owedSet;
     if (mgrResult.shortfall) entry.warnings.push(`관리자 인원 부족 (${mgrResult.shortfall}명 미배정)`);
+    stats.altTotal += mgrResult.altTotal;
+    stats.altExceptions += mgrResult.altExceptions;
 
-    const fkResult = assignSingleSlot(workingMembers.forklift, date, excludeForklift, owed.forklift);
+    const fkResult = assignSingleSlot(workingMembers.forklift, date, dow, excludeForklift, owed.forklift);
     entry.forklift = fkResult.picked;
     owed.forklift = fkResult.owedSet;
     if (fkResult.shortfall) entry.warnings.push(`지게차 인원 부족 (${fkResult.shortfall}명 미배정)`);
+    stats.altTotal += fkResult.altTotal;
+    stats.altExceptions += fkResult.altExceptions;
 
-    const requiredTotal = dow === 'sat' ? data.field.requiredSat : data.field.requiredSun;
-    const minFbPerDay = dow === 'sat' ? data.field.minFbSat : data.field.minFbSun;
-    const fieldResult = assignFieldDay(
-      workingMembers.field, minFbPerDay, date, requiredTotal, excludeField, owed.field
-    );
-    entry.field = fieldResult.picked;
-    owed.field = fieldResult.owedSet;
-    entry.warnings.push(...fieldResult.warnings);
+    pools.forEach((pool) => {
+      const poolMembers = workingMembers.field.filter((m) => poolIncludes(pool, m));
+      const required = dow === 'sat' ? pool.requiredSat : pool.requiredSun;
+      const minFb = dow === 'sat' ? pool.minFbSat : pool.minFbSun;
+      const label = pool.dept ? `현장(${pool.dept})` : '현장';
+      const fieldResult = assignFieldDay(
+        poolMembers, minFb, date, dow, required, excludeField, owed.field, label
+      );
+      entry.fieldByDept[pool.key] = fieldResult.picked;
+      owed.field = fieldResult.owedSet;
+      entry.warnings.push(...fieldResult.warnings);
+      stats.altTotal += fieldResult.altTotal;
+      stats.altExceptions += fieldResult.altExceptions;
+    });
+    syncFlatField(entry, pools);
 
     bumpWorkingMembers(workingMembers.managers, entry.managers, iso);
     bumpWorkingMembers(workingMembers.forklift, entry.forklift, iso);
@@ -587,7 +794,7 @@ function generateMonthSchedule(year, month, data) {
     days.push(entry);
   }
 
-  return { days, owed, workingMembers };
+  return { days, owed, workingMembers, pools, mode, stats };
 }
 
 /* ============================================================
@@ -595,6 +802,18 @@ function generateMonthSchedule(year, month, data) {
  * ============================================================ */
 let DATA = null;
 let currentDraft = null;
+
+const MODE_STORAGE_KEY = 'ff2_mode';
+
+function loadSavedMode() {
+  try {
+    const saved = localStorage.getItem(MODE_STORAGE_KEY);
+    if (MODE_BUTTONS.some((b) => b.key === saved)) return saved;
+  } catch (e) { /* 저장소를 못 쓰는 환경이면 기본값 */ }
+  return DEFAULT_MODE;
+}
+
+let currentMode = loadSavedMode();
 
 const yearSelectEl = document.getElementById('yearSelect');
 const monthSelectEl = document.getElementById('monthSelect');
@@ -645,11 +864,21 @@ function getWeekendExcluded(draft, dayIdx, group, data) {
   return computeWeekendExclusion(prevEntry, day.dow, parseISODate(day.date), group, data);
 }
 
-function buildSlotOptions(draft, dayIdx, group, slotIndex, data) {
+/** 이 칸에 지금 들어있는 이름. 현장은 부서(풀)별로 따로 저장돼 있다 */
+function getSlotName(day, group, slotIndex, pool) {
+  if (group === 'field' && pool) return (day.fieldByDept[pool.key] || [])[slotIndex] || '';
+  return day[group][slotIndex] || '';
+}
+
+function buildSlotOptions(draft, dayIdx, group, slotIndex, data, pool) {
   const day = draft.days[dayIdx];
   const date = parseISODate(day.date);
-  const members = data[group].members;
-  const usedElsewhereThisDay = new Set(day[group].filter((n, idx) => idx !== slotIndex));
+  const currentName = getSlotName(day, group, slotIndex, pool);
+  // 운영2 칸에는 운영2 인원만 후보로 보여준다 (부서 인원수가 부서별로 정해져 있으니까)
+  const members = group === 'field' && pool && pool.dept !== null
+    ? data.field.members.filter((m) => m.dept === pool.dept)
+    : data[group].members;
+  const usedElsewhereThisDay = new Set(day[group].filter((n) => n && n !== currentName));
   const excluded = getWeekendExcluded(draft, dayIdx, group, data);
   // 고정근무자는 매주 토·일 전부 근무하는 게 정상이라, "전날 근무해서 오늘 제외"
   // 규칙(규칙9)의 대상이 아니다 — 로테이션 인원에게만 적용한다.
@@ -660,10 +889,10 @@ function buildSlotOptions(draft, dayIdx, group, slotIndex, data) {
     .map((m) => m.name);
 }
 
-function renderSlotSelect(draft, dayIdx, group, slotIndex, data) {
+function renderSlotSelect(draft, dayIdx, group, slotIndex, data, pool) {
   const day = draft.days[dayIdx];
-  const currentName = day[group][slotIndex] || '';
-  const options = buildSlotOptions(draft, dayIdx, group, slotIndex, data);
+  const currentName = getSlotName(day, group, slotIndex, pool);
+  const options = buildSlotOptions(draft, dayIdx, group, slotIndex, data, pool);
   if (currentName && !options.includes(currentName)) options.unshift(currentName);
 
   const blankOpt = currentName ? '' : '<option value="">미배정</option>';
@@ -674,7 +903,8 @@ function renderSlotSelect(draft, dayIdx, group, slotIndex, data) {
     })
     .join('');
 
-  return `<select class="slot-select" data-day-idx="${dayIdx}" data-group="${group}" data-slot-index="${slotIndex}">${blankOpt}${optsHtml}</select>`;
+  const poolAttr = group === 'field' && pool ? ` data-pool-key="${escapeHtml(pool.key)}"` : '';
+  return `<select class="slot-select" data-day-idx="${dayIdx}" data-group="${group}" data-slot-index="${slotIndex}"${poolAttr}>${blankOpt}${optsHtml}</select>`;
 }
 
 function renderSchedule(draft, data) {
@@ -684,11 +914,15 @@ function renderSchedule(draft, data) {
     return;
   }
 
-  const fieldCols = Math.max(data.field.requiredSat, data.field.requiredSun);
+  const pools = draft.pools;
+  const multiPool = pools.length > 1;
+  const fieldCols = pools.reduce((sum, p) => sum + p.cols, 0);
 
   let html = '<table class="schedule-table"><thead><tr>';
   html += '<th>날짜</th><th>관리자</th><th>지게차</th>';
-  for (let i = 0; i < fieldCols; i++) html += `<th>현장${i + 1}</th>`;
+  pools.forEach((p) => {
+    for (let i = 0; i < p.cols; i++) html += `<th>${multiPool ? `${escapeHtml(p.dept)} ` : ''}현장${i + 1}</th>`;
+  });
   html += '</tr></thead><tbody>';
 
   draft.days.forEach((day, dayIdx) => {
@@ -704,13 +938,17 @@ function renderSchedule(draft, data) {
     } else {
       html += `<td>${renderSlotSelect(draft, dayIdx, 'managers', 0, data)}</td>`;
       html += `<td>${renderSlotSelect(draft, dayIdx, 'forklift', 0, data)}</td>`;
-      for (let i = 0; i < fieldCols; i++) {
-        if (i < day.field.length || i < (day.dow === 'sat' ? data.field.requiredSat : data.field.requiredSun)) {
-          html += `<td>${renderSlotSelect(draft, dayIdx, 'field', i, data)}</td>`;
-        } else {
-          html += '<td>—</td>';
+      pools.forEach((pool) => {
+        const picks = day.fieldByDept[pool.key] || [];
+        const required = day.dow === 'sat' ? pool.requiredSat : pool.requiredSun;
+        for (let i = 0; i < pool.cols; i++) {
+          if (i < picks.length || i < required) {
+            html += `<td>${renderSlotSelect(draft, dayIdx, 'field', i, data, pool)}</td>`;
+          } else {
+            html += '<td>—</td>';
+          }
         }
-      }
+      });
     }
     html += '</tr>';
 
@@ -734,26 +972,53 @@ function onSlotChange(evt) {
   const dayIdx = Number(sel.dataset.dayIdx);
   const group = sel.dataset.group;
   const slotIndex = Number(sel.dataset.slotIndex);
-  currentDraft.days[dayIdx][group][slotIndex] = sel.value;
+  const day = currentDraft.days[dayIdx];
+  if (group === 'field') {
+    const key = sel.dataset.poolKey || '';
+    const picks = day.fieldByDept[key] || (day.fieldByDept[key] = []);
+    while (picks.length < slotIndex) picks.push('');
+    picks[slotIndex] = sel.value;
+    syncFlatField(day, currentDraft.pools);
+  } else {
+    day[group][slotIndex] = sel.value;
+  }
   renderSchedule(currentDraft, DATA);
   setStatus('슬롯을 수정했습니다. 이후 날짜의 자동배정에는 영향을 주지 않습니다.', 'success');
 }
 
+/** 시트 상태 경고(부서 미입력, 읽을 수 없는 날짜 등)를 배너로 보여준다 */
+function renderDataWarnings(data) {
+  const el = document.getElementById('dataWarnings');
+  const warnings = (data && data.warnings) || [];
+  if (!warnings.length) {
+    el.hidden = true;
+    el.innerHTML = '';
+    return;
+  }
+  el.innerHTML = `<strong>시트 확인이 필요합니다</strong><ul>${warnings.map((w) => `<li>${escapeHtml(w)}</li>`).join('')}</ul>`;
+  el.hidden = false;
+}
+
 function renderRosterStatus(data) {
   const container = document.getElementById('rosterContainer');
-  const fieldScheduleWorkerNames = getScheduleWorkers(data.field.members).map((m) => m.name);
+  // 현장은 선택한 모드(풀필먼트2팀/운영2)에 해당하는 부서 인원만 보여준다
+  const pools = getFieldPools(data, currentMode);
+  const fieldScopeMembers = data.field.members.filter((m) => pools.some((p) => poolIncludes(p, m)));
+  const showDeptTag = pools.length > 1;
+  const scopeSuffix = pools.length === 1 && pools[0].dept ? ` · ${pools[0].dept}` : '';
+  const fieldScheduleWorkerNames = getScheduleWorkers(fieldScopeMembers).map((m) => m.name);
   const fieldTitle = fieldScheduleWorkerNames.length
-    ? `${data.field.label} (+ ${fieldScheduleWorkerNames.join(', ')} 고정)`
-    : data.field.label;
+    ? `${data.field.label}${scopeSuffix} (+ ${fieldScheduleWorkerNames.join(', ')} 고정)`
+    : `${data.field.label}${scopeSuffix}`;
   const groups = [
-    { key: 'managers', title: data.managers.label },
-    { key: 'forklift', title: data.forklift.label },
-    { key: 'field', title: fieldTitle },
+    { key: 'managers', title: data.managers.label, members: data.managers.members },
+    { key: 'forklift', title: data.forklift.label, members: data.forklift.members },
+    { key: 'field', title: fieldTitle, members: fieldScopeMembers },
   ];
 
   container.innerHTML = groups
     .map((g) => {
-      const members = data[g.key].members
+      const members = g.members
         .filter((m) => !m.scheduleWorker)
         .slice()
         .sort((a, b) => a.count - b.count || (a.lastWorked || '').localeCompare(b.lastWorked || ''));
@@ -761,7 +1026,7 @@ function renderRosterStatus(data) {
         .map(
           (m) => `
         <tr>
-          <td>${escapeHtml(m.name)}${g.key === 'field' && m.fb ? '<span class="fb-tag">FB</span>' : ''}</td>
+          <td>${escapeHtml(m.name)}${g.key === 'field' && m.fb ? '<span class="fb-tag">FB</span>' : ''}${g.key === 'field' && showDeptTag && m.dept ? `<span class="dept-tag">${escapeHtml(m.dept)}</span>` : ''}</td>
           <td class="num">${m.count}</td>
           <td>${m.lastWorked || '-'}</td>
         </tr>`
@@ -793,6 +1058,12 @@ function buildCommitPayload(draft, data) {
   const deltas = { managers: new Map(), forklift: new Map(), field: new Map() };
   const scheduleLogRows = [];
   const fieldScheduleWorkerNames = getScheduleWorkerNameSet(data.field.members);
+  const deptByName = new Map(data.field.members.map((m) => [m.name, m.dept]));
+  // ScheduleLog는 컬럼 구조를 바꾸면 Apps Script 재배포가 필요해서, 부서는 그룹 칸에 "현장·운영2"처럼 적는다.
+  const fieldGroupLabel = (name) => {
+    const dept = deptByName.get(name);
+    return dept ? `${data.field.label}·${dept}` : data.field.label;
+  };
 
   draft.days.forEach((day) => {
     if (day.isHoliday) return;
@@ -810,7 +1081,7 @@ function buildCommitPayload(draft, data) {
       .filter((name) => name && !fieldScheduleWorkerNames.has(name))
       .forEach((name) => {
         bumpDelta(deltas.field, name, day.date);
-        scheduleLogRows.push({ date: day.date, weekday, group: data.field.label, name });
+        scheduleLogRows.push({ date: day.date, weekday, group: fieldGroupLabel(name), name });
       });
   });
 
@@ -885,8 +1156,13 @@ async function onExport() {
     const monthLabel = `${yearSelectEl.value}년 ${monthSelectEl.value}월`;
     const sheet = wb.addWorksheet(monthLabel, { properties: { tabColor: { argb: 'FFDBDBDB' } } });
 
-    const fieldCols = Math.max(DATA.field.requiredSat, DATA.field.requiredSun);
-    const headers = ['날짜', '관리자', '지게차', ...Array.from({ length: fieldCols }, (_, i) => `현장${i + 1}`)];
+    const pools = currentDraft.pools;
+    const multiPool = pools.length > 1;
+    const fieldCols = pools.reduce((sum, p) => sum + p.cols, 0);
+    const fieldHeaders = pools.flatMap((p) =>
+      Array.from({ length: p.cols }, (_, i) => `${multiPool ? `${p.dept} ` : ''}현장${i + 1}`)
+    );
+    const headers = ['날짜', '관리자', '지게차', ...fieldHeaders];
     sheet.addRow(headers);
 
     const thin = { style: 'thin', color: { argb: 'FFBFBFBF' } };
@@ -906,7 +1182,10 @@ async function onExport() {
         rowValues.push(`공휴일 휴무 (${day.holidayLabel})`, '', ...Array(fieldCols).fill(''));
       } else {
         rowValues.push(day.managers[0] || '', day.forklift[0] || '');
-        for (let i = 0; i < fieldCols; i++) rowValues.push(day.field[i] || '');
+        pools.forEach((p) => {
+          const picks = day.fieldByDept[p.key] || [];
+          for (let i = 0; i < p.cols; i++) rowValues.push(picks[i] || '');
+        });
       }
       const row = sheet.addRow(rowValues);
       row.eachCell((cell) => {
@@ -931,7 +1210,7 @@ async function onExport() {
 
     const buffer = await wb.xlsx.writeBuffer();
     const blob = new Blob([buffer], { type: 'application/octet-stream' });
-    const fileName = `풀필먼트2팀_근무표_${yearSelectEl.value}${String(monthSelectEl.value).padStart(2, '0')}.xlsx`;
+    const fileName = `${getModeLabel(currentDraft.mode)}_근무표_${yearSelectEl.value}${String(monthSelectEl.value).padStart(2, '0')}.xlsx`;
     saveAs(blob, fileName);
     setStatus('엑셀 다운로드가 완료되었습니다.', 'success');
   } catch (err) {
@@ -995,7 +1274,7 @@ function buildAssignColumnHtml(rows) {
   return `<table class="assign-table"><thead><tr><th style="width:110px;">날짜</th><th>이름</th><th class="blank-cell">대체휴무일</th></tr></thead><tbody>${rowsHtml}</tbody></table>`;
 }
 
-function buildHandoutHtml(year, month, forkliftRows, fieldRows, weeks) {
+function buildHandoutHtml(year, month, forkliftRows, fieldRows, weeks, scopeLabel) {
   const weekDayNames = ['일', '월', '화', '수', '목', '금', '토'];
 
   // 지게차는 하루 1명뿐이라 표 하나로 충분하고, 현장은 인원이 많아서
@@ -1021,7 +1300,7 @@ function buildHandoutHtml(year, month, forkliftRows, fieldRows, weeks) {
 
   return `<!doctype html>
 <html lang="ko"><head><meta charset="utf-8">
-<title>현장전달문서_${year}${String(month).padStart(2, '0')}</title>
+<title>${escapeHtml(scopeLabel)}_현장전달문서_${year}${String(month).padStart(2, '0')}</title>
 <link rel="stylesheet" as="style" crossorigin href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.css">
 <style>
   @page { size: A4 portrait; margin: 10mm; }
@@ -1050,7 +1329,7 @@ function buildHandoutHtml(year, month, forkliftRows, fieldRows, weeks) {
 </style>
 </head>
 <body>
-  <h1>풀필먼트2팀 현장전달문서</h1>
+  <h1>${escapeHtml(scopeLabel)} 현장전달문서</h1>
   <p class="sub">${year}년 ${month}월 · 지게차 / 현장 근무자용 — 근무하신 날짜의 대체휴무일을 직접 적어 제출해주세요.</p>
 
   <h2 class="section-title">지게차 근무 확인 및 대체휴무일 기재</h2>
@@ -1075,7 +1354,7 @@ function onHandoutDownload() {
   const { forkliftRows, fieldRows } = buildHandoutRows(currentDraft, DATA);
   const draftByDate = new Map(currentDraft.days.map((d) => [d.date, d]));
   const weeks = buildCalendarWeeks(year, month, draftByDate, DATA);
-  const html = buildHandoutHtml(year, month, forkliftRows, fieldRows, weeks);
+  const html = buildHandoutHtml(year, month, forkliftRows, fieldRows, weeks, getModeLabel(currentDraft.mode));
 
   const printWindow = window.open('', '_blank');
   if (!printWindow) {
@@ -1104,6 +1383,7 @@ async function reloadData() {
   try {
     DATA = await loadData();
     renderRosterStatus(DATA);
+    renderDataWarnings(DATA);
     setStatus('데이터를 불러왔습니다.', 'success');
   } catch (err) {
     setStatus(`데이터 로드 실패: ${err.message}`, 'error');
@@ -1118,12 +1398,45 @@ function onGenerate() {
   if (!DATA) return;
   const year = Number(yearSelectEl.value);
   const month = Number(monthSelectEl.value);
-  currentDraft = generateMonthSchedule(year, month, DATA);
+  currentDraft = generateMonthSchedule(year, month, DATA, currentMode);
   renderSchedule(currentDraft, DATA);
   document.getElementById('btnCommit').disabled = false;
   document.getElementById('btnExport').disabled = false;
   document.getElementById('btnHandout').disabled = false;
-  setStatus('배정표를 생성했습니다. 저장 전에 검토해주세요.', 'success');
+  const { altTotal, altExceptions } = currentDraft.stats;
+  const altMsg = altExceptions
+    ? ` 요일 교대 예외 ${altExceptions}/${altTotal}건 (인원이 모자라 같은 요일을 연속 배정).`
+    : '';
+  setStatus(`[${getModeLabel(currentMode)}] 배정표를 생성했습니다.${altMsg} 저장 전에 검토해주세요.`, 'success');
+}
+
+function updateModeButtons() {
+  document.querySelectorAll('.mode-btn').forEach((btn) => {
+    const active = btn.dataset.mode === currentMode;
+    btn.classList.toggle('active', active);
+    btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+  });
+}
+
+function setMode(key) {
+  if (key === currentMode) return;
+  currentMode = key;
+  try { localStorage.setItem(MODE_STORAGE_KEY, key); } catch (e) { /* 저장 실패는 무시 */ }
+  updateModeButtons();
+  resetDraftUi(false);
+  if (DATA) renderRosterStatus(DATA);
+  setStatus(`[${getModeLabel(key)}] 기준으로 전환했습니다. "자동배정 생성"을 눌러주세요.`, '');
+}
+
+function initModeSwitch() {
+  const box = document.getElementById('modeSwitch');
+  box.innerHTML = MODE_BUTTONS
+    .map((b) => `<button type="button" class="mode-btn" data-mode="${escapeHtml(b.key)}">${escapeHtml(b.label)}</button>`)
+    .join('');
+  box.querySelectorAll('.mode-btn').forEach((btn) => {
+    btn.addEventListener('click', () => setMode(btn.dataset.mode));
+  });
+  updateModeButtons();
 }
 
 document.getElementById('btnReload').addEventListener('click', reloadData);
@@ -1131,8 +1444,9 @@ document.getElementById('btnGenerate').addEventListener('click', onGenerate);
 document.getElementById('btnCommit').addEventListener('click', onCommit);
 document.getElementById('btnExport').addEventListener('click', onExport);
 document.getElementById('btnHandout').addEventListener('click', onHandoutDownload);
-yearSelectEl.addEventListener('change', resetDraftUi);
-monthSelectEl.addEventListener('change', resetDraftUi);
+yearSelectEl.addEventListener('change', () => resetDraftUi());
+monthSelectEl.addEventListener('change', () => resetDraftUi());
+initModeSwitch();
 
 /* ============================================================
  * 다크모드 — index.html의 인라인 스크립트가 최초 페인트 전에
