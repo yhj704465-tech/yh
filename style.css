@@ -383,6 +383,38 @@ select:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
+.slot-wrap { display: flex; align-items: center; gap: 4px; }
+.slot-remove {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: 50%;
+  background: var(--surface);
+  color: var(--text-muted);
+  font-size: 0.95rem;
+  line-height: 1;
+  cursor: pointer;
+}
+.slot-remove:hover { background: var(--danger-soft); border-color: var(--danger); color: var(--danger-text); }
+.slot-dash { color: var(--text-faint); padding: 0 4px; }
+.slot-add {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px dashed var(--accent);
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent-soft-text);
+  font-family: inherit;
+  font-size: 1rem;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+}
+.slot-add:hover { background: var(--accent); border-style: solid; color: #fff; }
 .slot-fixed {
   display: inline-block;
   padding: 4px 10px;

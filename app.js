@@ -1049,6 +1049,24 @@ function renderSlotSelect(draft, dayIdx, group, slotIndex, data, pool) {
   return `<select class="slot-select" data-day-idx="${dayIdx}" data-group="${group}" data-slot-index="${slotIndex}"${poolAttr}>${blankOpt}${optsHtml}</select>`;
 }
 
+/**
+ * 화면·엑셀에 필요한 열 수. 자동배정이 정한 기본 열 수와, 사람이 "+"로 칸을 늘린
+ * 날(바쁜 날)의 인원 중 더 큰 쪽을 쓴다.
+ */
+function getLayoutCols(draft) {
+  const gc = draft.groupCols || { managers: 1, forklift: 1 };
+  const cols = { managers: Math.max(1, gc.managers), forklift: Math.max(1, gc.forklift), pools: {} };
+  draft.pools.forEach((p) => { cols.pools[p.key] = Math.max(1, p.cols); });
+  draft.days.forEach((day) => {
+    cols.managers = Math.max(cols.managers, day.managers.length);
+    cols.forklift = Math.max(cols.forklift, day.forklift.length);
+    draft.pools.forEach((p) => {
+      cols.pools[p.key] = Math.max(cols.pools[p.key], (day.fieldByDept[p.key] || []).length);
+    });
+  });
+  return cols;
+}
+
 function renderSchedule(draft, data) {
   const container = document.getElementById('scheduleContainer');
   if (!draft || !draft.days.length) {
@@ -1058,19 +1076,44 @@ function renderSchedule(draft, data) {
 
   const pools = draft.pools;
   const multiPool = pools.length > 1;
-  const fieldCols = pools.reduce((sum, p) => sum + p.cols, 0);
-  const gc = draft.groupCols || { managers: 1, forklift: 1 };
+  const cols = getLayoutCols(draft);
+  const fieldCols = pools.reduce((sum, p) => sum + cols.pools[p.key], 0);
   const gr = draft.groupRequired || { managers: DEFAULT_GROUP_REQUIRED, forklift: DEFAULT_GROUP_REQUIRED };
-  const totalCols = 1 + gc.managers + gc.forklift + fieldCols;
+  const totalCols = 1 + cols.managers + cols.forklift + fieldCols;
 
   let html = '<table class="schedule-table"><thead><tr>';
   html += '<th>날짜</th>';
-  groupHeaderLabels('관리자', gc.managers).forEach((h) => { html += `<th>${h}</th>`; });
-  groupHeaderLabels('지게차', gc.forklift).forEach((h) => { html += `<th>${h}</th>`; });
+  groupHeaderLabels('관리자', cols.managers).forEach((h) => { html += `<th>${h}</th>`; });
+  groupHeaderLabels('지게차', cols.forklift).forEach((h) => { html += `<th>${h}</th>`; });
   pools.forEach((p) => {
-    for (let i = 0; i < p.cols; i++) html += `<th>${multiPool ? `${escapeHtml(p.dept)} ` : ''}현장${i + 1}</th>`;
+    for (let i = 0; i < cols.pools[p.key]; i++) html += `<th>${multiPool ? `${escapeHtml(p.dept)} ` : ''}현장${i + 1}</th>`;
   });
   html += '</tr></thead><tbody>';
+
+  // 칸 하나 = 선택 목록. 그 날짜·그룹의 마지막 칸 옆에는 "+"(칸 추가) 버튼을, 필요인원을 넘어서
+  // 사람이 늘린 칸 옆에는 "×"(삭제) 버튼을 붙인다.
+  const dataAttrs = (dayIdx, group, i, pool) =>
+    `data-day-idx="${dayIdx}" data-group="${group}" data-slot-index="${i}"${group === 'field' && pool ? ` data-pool-key="${escapeHtml(pool.key)}"` : ''}`;
+  const groupLabelOf = (group, pool) => (group === 'managers' ? '관리자' : group === 'forklift' ? '지게차' : (pool && pool.dept ? `${pool.dept} 현장` : '현장'));
+  const addBtn = (dayIdx, group, i, pool) =>
+    `<button type="button" class="slot-add" title="${escapeHtml(groupLabelOf(group, pool))} 근무 칸 추가 (바쁜 날)" aria-label="${escapeHtml(groupLabelOf(group, pool))} 근무 칸 추가" ${dataAttrs(dayIdx, group, i, pool)}>+</button>`;
+  const removeBtn = (dayIdx, group, i, pool) =>
+    `<button type="button" class="slot-remove" title="추가한 칸 삭제" aria-label="추가한 칸 삭제" ${dataAttrs(dayIdx, group, i, pool)}>×</button>`;
+  const groupCells = (dayIdx, group, list, required, colCount, pool) => {
+    const lastIdx = Math.max(list.length, required) - 1;
+    let out = '';
+    for (let i = 0; i < colCount; i++) {
+      const hasSlot = i < list.length || i < required;
+      const addHere = hasSlot ? i === lastIdx : (lastIdx < 0 && i === 0);
+      if (!hasSlot) {
+        out += addHere ? `<td><div class="slot-wrap"><span class="slot-dash">—</span>${addBtn(dayIdx, group, i, pool)}</div></td>` : '<td>—</td>';
+        continue;
+      }
+      const extra = i >= required;
+      out += `<td><div class="slot-wrap">${renderSlotSelect(draft, dayIdx, group, i, data, pool)}${extra ? removeBtn(dayIdx, group, i, pool) : ''}${addHere ? addBtn(dayIdx, group, i, pool) : ''}</div></td>`;
+    }
+    return out;
+  };
 
   // 수정까지 반영한 현재 배정표에서, 월 3번째 이상 근무가 되는 날에 참고 표시를 붙인다
   const skipField = getScheduleWorkerNameSet(data.field.members);
@@ -1102,21 +1145,11 @@ function renderSchedule(draft, data) {
     } else {
       ['managers', 'forklift'].forEach((g) => {
         const required = day.dow === 'sat' ? gr[g].sat : gr[g].sun;
-        for (let i = 0; i < gc[g]; i++) {
-          if (i < day[g].length || i < required) html += `<td>${renderSlotSelect(draft, dayIdx, g, i, data)}</td>`;
-          else html += '<td>—</td>';
-        }
+        html += groupCells(dayIdx, g, day[g], required, cols[g], null);
       });
       pools.forEach((pool) => {
-        const picks = day.fieldByDept[pool.key] || [];
         const required = day.dow === 'sat' ? pool.requiredSat : pool.requiredSun;
-        for (let i = 0; i < pool.cols; i++) {
-          if (i < picks.length || i < required) {
-            html += `<td>${renderSlotSelect(draft, dayIdx, 'field', i, data, pool)}</td>`;
-          } else {
-            html += '<td>—</td>';
-          }
-        }
+        html += groupCells(dayIdx, 'field', day.fieldByDept[pool.key] || [], required, cols.pools[pool.key], pool);
       });
     }
     html += '</tr>';
@@ -1135,6 +1168,46 @@ function renderSchedule(draft, data) {
   container.querySelectorAll('select.slot-select').forEach((sel) => {
     sel.addEventListener('change', onSlotChange);
   });
+  container.querySelectorAll('button.slot-add').forEach((b) => b.addEventListener('click', onSlotAdd));
+  container.querySelectorAll('button.slot-remove').forEach((b) => b.addEventListener('click', onSlotRemove));
+}
+
+/** 그 날짜·그룹의 배정 목록(배열)과 그날 자동배정이 정한 필요인원 */
+function getDaySlotList(day, group, poolKey) {
+  if (group === 'field') {
+    const pool = currentDraft.pools.find((pl) => pl.key === poolKey);
+    const required = pool ? (day.dow === 'sat' ? pool.requiredSat : pool.requiredSun) : 0;
+    if (!day.fieldByDept[poolKey]) day.fieldByDept[poolKey] = [];
+    return { slots: day.fieldByDept[poolKey], required, label: pool && pool.dept ? `${pool.dept} 현장` : '현장' };
+  }
+  const gr = currentDraft.groupRequired || { managers: DEFAULT_GROUP_REQUIRED, forklift: DEFAULT_GROUP_REQUIRED };
+  const required = day.dow === 'sat' ? gr[group].sat : gr[group].sun;
+  return { slots: day[group], required, label: group === 'managers' ? '관리자' : '지게차' };
+}
+
+/** "+ 버튼" — 바쁜 날에 근무 칸을 한 칸 더 늘린다 (추가한 칸은 미배정으로 시작) */
+function onSlotAdd(evt) {
+  const btn = evt.currentTarget;
+  const day = currentDraft.days[Number(btn.dataset.dayIdx)];
+  const group = btn.dataset.group;
+  const { slots, required, label } = getDaySlotList(day, group, btn.dataset.poolKey || '');
+  while (slots.length < required) slots.push(''); // 자동배정이 못 채운 칸이 있어도 새 칸이 항상 맨 뒤에 생기게
+  slots.push('');
+  if (group === 'field') syncFlatField(day, currentDraft.pools);
+  renderSchedule(currentDraft, DATA);
+  setStatus(`${formatKoreanDate(day.date)} ${label}에 칸을 하나 추가했습니다. 추가한 칸에서 근무자를 선택해 주세요. (칸 옆 × 로 삭제)`, 'success');
+}
+
+/** 추가했던 칸 삭제 — 필요인원을 넘는 칸에만 삭제 버튼이 나온다 */
+function onSlotRemove(evt) {
+  const btn = evt.currentTarget;
+  const day = currentDraft.days[Number(btn.dataset.dayIdx)];
+  const group = btn.dataset.group;
+  const { slots, label } = getDaySlotList(day, group, btn.dataset.poolKey || '');
+  slots.splice(Number(btn.dataset.slotIndex), 1);
+  if (group === 'field') syncFlatField(day, currentDraft.pools);
+  renderSchedule(currentDraft, DATA);
+  setStatus(`${formatKoreanDate(day.date)} ${label}의 추가한 칸을 삭제했습니다.`, 'success');
 }
 
 function onSlotChange(evt) {
@@ -1388,12 +1461,11 @@ async function onExport() {
 
     const pools = currentDraft.pools;
     const multiPool = pools.length > 1;
+    const cols = getLayoutCols(currentDraft); // "+"로 늘린 칸까지 포함
     const fieldHeaders = pools.flatMap((p) =>
-      Array.from({ length: p.cols }, (_, i) => `${multiPool ? `${p.dept} ` : ''}현장${i + 1}`)
+      Array.from({ length: cols.pools[p.key] }, (_, i) => `${multiPool ? `${p.dept} ` : ''}현장${i + 1}`)
     );
-    const gc = currentDraft.groupCols || { managers: 1, forklift: 1 };
-    const gr = currentDraft.groupRequired || { managers: DEFAULT_GROUP_REQUIRED, forklift: DEFAULT_GROUP_REQUIRED };
-    const headers = ['날짜', ...groupHeaderLabels('관리자', gc.managers), ...groupHeaderLabels('지게차', gc.forklift), ...fieldHeaders];
+    const headers = ['날짜', ...groupHeaderLabels('관리자', cols.managers), ...groupHeaderLabels('지게차', cols.forklift), ...fieldHeaders];
     sheet.addRow(headers);
 
     const thin = { style: 'thin', color: { argb: 'FFBFBFBF' } };
@@ -1413,11 +1485,11 @@ async function onExport() {
         rowValues.push(`공휴일 휴무 (${day.holidayLabel})`, ...Array(headers.length - 2).fill(''));
       } else {
         ['managers', 'forklift'].forEach((g) => {
-          for (let i = 0; i < gc[g]; i++) rowValues.push(day[g][i] || '');
+          for (let i = 0; i < cols[g]; i++) rowValues.push(day[g][i] || '');
         });
         pools.forEach((p) => {
           const picks = day.fieldByDept[p.key] || [];
-          for (let i = 0; i < p.cols; i++) rowValues.push(picks[i] || '');
+          for (let i = 0; i < cols.pools[p.key]; i++) rowValues.push(picks[i] || '');
         });
       }
       const row = sheet.addRow(rowValues);
