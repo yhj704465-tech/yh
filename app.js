@@ -23,6 +23,9 @@
  *   - 부서 칸에 "지게차" 또는 "관리자"를 적으면 그 그룹의 요일별 하루 필요인원이 된다.
  *     (예: 토요일 | 지게차 | 2). 적지 않으면 하루 1명이다. 0이면 그 요일엔 배정하지 않는다.
  *   - 비워두면 운영1 토1/일2 + 운영2 토2/일2로 동작합니다.
+ * scheduleLogCsv (선택) : ScheduleLog 탭(날짜 | 요일 | 그룹 | 이름)을 CSV로 게시한 URL.
+ *   채우면 "최근 3개월 근무 횟수(신규 인원은 근무 가능했던 달 기준 평균)"로 공평하게 배정하고,
+ *   비워두면 예전처럼 누적횟수 기준으로 동작한다. 확정 저장을 하면 이 탭에 근무 기록이 쌓인다.
  * appsScriptUrl : Apps Script를 웹앱으로 배포한 .../exec 주소
  * ============================================================ */
 const CONFIG = {
@@ -34,6 +37,7 @@ const CONFIG = {
     holidays: 'https://docs.google.com/spreadsheets/d/e/2PACX-1vSJDCbE2_IAeJws9NdoGOvq4xWP5O1FRqd1dgSTnjg8hGfJzSWPB_uY6GBDO2ERwGtIdcx7ZAeSZWRg/pub?gid=732531628&single=true&output=csv',
   },
   fieldConfigCsv: 'https://docs.google.com/spreadsheets/d/e/2PACX-1vSJDCbE2_IAeJws9NdoGOvq4xWP5O1FRqd1dgSTnjg8hGfJzSWPB_uY6GBDO2ERwGtIdcx7ZAeSZWRg/pub?gid=1178110041&single=true&output=csv',
+  scheduleLogCsv: '',
   appsScriptUrl: 'https://script.google.com/macros/s/AKfycbzeXNoXgwrPhQCVXRIEJKGY4ZH2XWZ2U49gxCdB_QScQSITTrpC6g6Efje9zbOaU5y5/exec',
   rules: {
     newHireGraceMonths: 1,
@@ -203,6 +207,7 @@ function cloneMockData() {
       monthLimits: {},
     },
     holidays: new Map(MOCK_DATA.holidays),
+    shiftLog: null,
     warnings: [],
   };
 }
@@ -306,6 +311,51 @@ function escapeHtml(s) {
 /* ============================================================
  * 데이터 로딩 (Google Sheets CSV 게시 → JSON, 미설정 시 MOCK_DATA)
  * ============================================================ */
+/** 헤더 없이 칸 위치로 읽는 CSV (ScheduleLog: 날짜 | 요일 | 그룹 | 이름) */
+function fetchCsvRows(url, bust) {
+  return new Promise((resolve, reject) => {
+    const fullUrl = `${url}${url.includes('?') ? '&' : '?'}${bust}`;
+    Papa.parse(fullUrl, {
+      download: true,
+      header: false,
+      skipEmptyLines: true,
+      complete: (res) => resolve(res.data),
+      error: reject,
+    });
+  });
+}
+
+/** ScheduleLog의 그룹 칸("관리자" / "지게차" / "현장" / "현장·운영2")을 그룹 키로 */
+function logGroupKey(label) {
+  const s = String(label || '').trim();
+  if (s.startsWith('관리자')) return 'managers';
+  if (s.startsWith('지게차')) return 'forklift';
+  if (s.startsWith('현장')) return 'field';
+  return null;
+}
+
+/**
+ * 확정 저장으로 쌓인 근무 기록. URL이 없으면 null(= 누적횟수 기준으로 동작), 읽기에 실패하면
+ * null과 에러 메시지를 돌려준다.
+ */
+async function loadShiftLog() {
+  const url = CONFIG.scheduleLogCsv;
+  if (!url || !url.startsWith('http')) return { log: null, error: '' };
+  try {
+    const rows = await fetchCsvRows(url, `cachebust=${Date.now()}`);
+    const log = [];
+    rows.forEach((r) => {
+      const date = normalizeDateString(r[0]); // 머리글 줄은 날짜가 아니라서 자연스럽게 걸러진다
+      const group = logGroupKey(r[2]);
+      const name = String(r[3] || '').trim();
+      if (date && group && name) log.push({ date, group, name });
+    });
+    return { log, error: '' };
+  } catch (err) {
+    return { log: null, error: String((err && err.message) || err) };
+  }
+}
+
 function fetchCsv(url, bust) {
   return new Promise((resolve, reject) => {
     const fullUrl = `${url}${url.includes('?') ? '&' : '?'}${bust}`;
@@ -498,13 +548,14 @@ async function loadData() {
 
   const bust = `cachebust=${Date.now()}`;
   PARSE_WARNINGS = [];
-  const [managersRows, forkliftRows, fieldRows, tieRows, holidayRows, fieldConfig] = await Promise.all([
+  const [managersRows, forkliftRows, fieldRows, tieRows, holidayRows, fieldConfig, shiftLogResult] = await Promise.all([
     fetchCsv(CONFIG.csv.managers, bust),
     fetchCsv(CONFIG.csv.forklift, bust),
     fetchCsv(CONFIG.csv.field, bust),
     fetchCsv(CONFIG.csv.tieBreakHistory, bust),
     fetchCsv(CONFIG.csv.holidays, bust),
     loadFieldConfig(),
+    loadShiftLog(),
   ]);
 
   const data = {
@@ -523,17 +574,22 @@ async function loadData() {
         .filter(([iso]) => iso)
     ),
   };
+  data.shiftLog = shiftLogResult.log;
   data.warnings = buildDataWarnings(data, {
     fieldHasDeptColumn: fieldRows.length > 0 && '부서' in fieldRows[0],
     configHasDeptRows: fieldConfig.hasDeptRows,
   });
+  if (shiftLogResult.error) {
+    data.warnings.push(`ScheduleLog를 읽지 못해 이번에는 누적횟수 기준으로 배정합니다 (${shiftLogResult.error}). 시트 게시 상태와 scheduleLogCsv 주소를 확인해주세요.`);
+  }
   return data;
 }
 
 /* ============================================================
  * 배정 알고리즘
  *
- * 우선순위: 누적횟수 오름차순 (요일 교대에 어긋나면 횟수를 +2로 셈) →
+ * 우선순위: 근무 횟수 오름차순 (요일 교대에 어긋나면 횟수를 +2로 셈. 횟수는 ScheduleLog가 연결돼 있으면
+ *           최근 3개월 기준, 아니면 누적횟수) →
  *           교대에 맞는 사람 → 최근근무일 오름차순(오래전 우선) →
  *           지난 동률에서 밀린 이력(owed) 우선 → 이름순(최종 결정론적 fallback)
  *
@@ -549,6 +605,68 @@ function isEligible(member, date) {
     if (date < graceDate) return false;
   }
   return true;
+}
+
+/* ------------------------------------------------------------
+ * 최근 3개월 공평성 — 누적횟수 대신 "직전 3개월 + 이번 달 진행분"의 근무 횟수로 순위를 매긴다.
+ *  - 기록(ScheduleLog)이 있는 달만 센다. 기록이 아직 3개월치 안 쌓였으면 있는 달만으로 시작한다.
+ *  - 신규 입사자는 근무 가능했던 달만 세고, 개월 수가 다른 사람과 비교할 수 있게
+ *    (횟수 ÷ 근무 가능 개월 수 × 기준 개월 수)로 환산한다 → 따라잡으려고 더 서는 일이 없다.
+ * ------------------------------------------------------------ */
+function shiftYm(year, month, delta) {
+  const idx = year * 12 + (month - 1) + delta;
+  return ymKey(Math.floor(idx / 12), (idx % 12) + 1);
+}
+
+/** 입사 유예(기본 1개월)가 끝나 처음 배정 대상이 되는 달 ("YYYY-MM"), 입사일이 없으면 null */
+function firstEligibleYm(member) {
+  if (!member.joinDate) return null;
+  const grace = addMonths(parseISODate(member.joinDate), CONFIG.rules.newHireGraceMonths);
+  return ymKey(grace.getFullYear(), grace.getMonth() + 1);
+}
+
+function buildHistoryIndex(shiftLog) {
+  const counts = { managers: new Map(), forklift: new Map(), field: new Map() };
+  const months = { managers: new Set(), forklift: new Set(), field: new Set() };
+  (shiftLog || []).forEach(({ date, group, name }) => {
+    const ym = date.slice(0, 7);
+    months[group].add(ym);
+    let byMonth = counts[group].get(name);
+    if (!byMonth) counts[group].set(name, (byMonth = new Map()));
+    byMonth.set(ym, (byMonth.get(ym) || 0) + 1);
+  });
+  return { counts, months };
+}
+
+/** 기록이 있는 직전 3개월(이번 달 제외) */
+function priorLoggedMonths(history, group, year, month) {
+  return [3, 2, 1].map((k) => shiftYm(year, month, -k)).filter((ym) => history.months[group].has(ym));
+}
+
+/** 그룹 인원들에게 "최근 3개월" 순위 정보(win)를 붙인다 */
+function attachFairnessWindow(members, group, history, year, month) {
+  const prior = priorLoggedMonths(history, group, year, month);
+  const cur = ymKey(year, month);
+  members.forEach((m) => {
+    const first = firstEligibleYm(m);
+    const eligible = (ym) => !first || ym >= first;
+    const byMonth = history.counts[group].get(m.name);
+    let total = 0;
+    let months = 0;
+    prior.forEach((ym) => {
+      if (!eligible(ym)) return;
+      months += 1;
+      total += (byMonth && byMonth.get(ym)) || 0;
+    });
+    if (eligible(cur)) months += 1;
+    m.win = { total, months: Math.max(1, months), base: prior.length + 1 };
+  });
+}
+
+/** 순위 매길 때 쓰는 "횟수" — 최근 3개월 기준이 켜져 있으면 환산 횟수, 아니면 누적횟수 */
+function fairCount(m) {
+  if (!m.win) return m.count;
+  return Math.round(((m.win.total * m.win.base) / m.win.months) * 1e6) / 1e6;
 }
 
 function lastShiftDow(member) {
@@ -569,6 +687,7 @@ function lastShiftDow(member) {
  * (교대를 횟수보다 앞세우면 토·일 1자리씩일 때 제외요일자가 12개월간 한 번도 못 뽑혔다)
  */
 const ALTERNATION_WEIGHT = 2;
+const ALTERNATION_WEIGHT_WINDOW = 0.5; // 최근 3개월 기준일 때
 
 function isAlternationExempt(member) {
   return !!(member.excludedWeekdays && member.excludedWeekdays.size);
@@ -584,12 +703,19 @@ function alternationClass(member, dow) {
  * 일요일 불가 현장 인원 등)은 애초에 교대할 수 없으니 유리도 불리도 없게 중간값을 준다.
  */
 function alternationPenalty(member, dow) {
-  if (isAlternationExempt(member)) return ALTERNATION_WEIGHT / 2;
-  return alternationClass(member, dow) * ALTERNATION_WEIGHT;
+  // 최근 3개월 기준(member.win)에서는 횟수가 작아서(월 1회 안팎) 벌점을 크게 주면 교대가 공평성을 밀어낸다.
+  // 26개월 시뮬레이션: 가중치 2 → 제외요일자가 다른 인원의 약 70%만 근무, 0.5 → 거의 동일(20 vs 21~23)하면서
+  // 교대 예외는 약 9%. 그래서 이 기준에서는 가중치를 ALTERNATION_WEIGHT_WINDOW로 낮춘다.
+  const w = member.win ? ALTERNATION_WEIGHT_WINDOW : ALTERNATION_WEIGHT;
+  // 제외요일자(교대 불가)에게 상수 벌점을 주면 최근 3개월 기준에서는 그대로 "근무 횟수 격차"로 굳어진다.
+  // 교대 가능한 사람은 벌점이 0인 순간(교대에 맞는 때)에 뽑히니까 실제로 내는 벌점이 거의 0이라서, 중간값을 주면
+  // 계속 손해를 본다. 그래서 이 기준에서는 벌점 없이(0) 겨루게 하고, 누적횟수 기준에서는 예전 값(가중치÷2)을 쓴다.
+  if (isAlternationExempt(member)) return member.win ? 0 : w / 2;
+  return alternationClass(member, dow) * w;
 }
 
 function tieKeyFor(dow) {
-  return (m) => `${m.count + alternationPenalty(m, dow)}|${alternationPenalty(m, dow)}|${m.count}|${m.lastWorked || ''}`;
+  return (m) => `${fairCount(m) + alternationPenalty(m, dow)}|${alternationPenalty(m, dow)}|${fairCount(m)}|${m.lastWorked || ''}`;
 }
 
 function rankCandidates(members, eligible, owedSet, dow) {
@@ -600,11 +726,13 @@ function rankCandidates(members, eligible, owedSet, dow) {
     .sort((a, b) => {
       const pa = penalty.get(a.name);
       const pb = penalty.get(b.name);
-      const scoreA = a.count + pa;
-      const scoreB = b.count + pb;
+      const countA = fairCount(a);
+      const countB = fairCount(b);
+      const scoreA = countA + pa;
+      const scoreB = countB + pb;
       if (scoreA !== scoreB) return scoreA - scoreB;
       if (pa !== pb) return pa - pb;
-      if (a.count !== b.count) return a.count - b.count;
+      if (countA !== countB) return countA - countB;
       const aLast = a.lastWorked || '';
       const bLast = b.lastWorked || '';
       if (aLast !== bLast) return aLast < bLast ? -1 : 1;
@@ -715,6 +843,7 @@ function bumpWorkingMembers(members, names, iso) {
     if (m.scheduleWorker) return; // 고정근무자는 로테이션 카운트 대상 아님
     if (nameSet.has(m.name)) {
       m.count += 1;
+      if (m.win) m.win.total += 1;
       if (!m.lastWorked || iso > m.lastWorked) m.lastWorked = iso;
     }
   });
@@ -755,14 +884,24 @@ function isFirstEligibleMonth(member, year, month) {
   return graceDate.getFullYear() === year && graceDate.getMonth() === month - 1;
 }
 
+/** 배정 대상이 된 첫 달의 바로 다음 달인지 */
+function isSecondEligibleMonth(member, year, month) {
+  const first = firstEligibleYm(member);
+  return !!first && shiftYm(Number(first.slice(0, 4)), Number(first.slice(5, 7)), 1) === ymKey(year, month);
+}
+
+const SECOND_MONTH_CAP = 2;
+
 /**
  * tier: 'soft' = 평소 상한, 'mid' = 지난달 3회 한 사람만 2회로 풀린 상태, 'max' = 절대 상한
  *   일반 인원      soft 2 / mid 2 / max 3
  *   지난달 3회한 사람 soft 1 / mid 2 / max 2
  *   신규 입사 첫 달   항상 1
+ *   신규 입사 둘째 달  항상 2 (그 다음 달부터는 일반 인원과 같이 최근 3개월 기준)
  */
 function monthlyCapFor(member, year, month, limitedNames, tier) {
   if (member && isFirstEligibleMonth(member, year, month)) return LIMITED_MONTH_CAP;
+  if (member && isSecondEligibleMonth(member, year, month)) return SECOND_MONTH_CAP;
   if (member && limitedNames.has(member.name)) return tier === 'soft' ? LIMITED_MONTH_CAP : LIMITED_MONTH_MAX_CAP;
   return tier === 'max' ? MONTHLY_MAX_CAP : MONTHLY_SOFT_CAP;
 }
@@ -876,6 +1015,10 @@ function generateMonthSchedule(year, month, data, mode = currentMode, prev = nul
     forklift: cloneMembers(data.forklift.members),
     field: cloneMembers(data.field.members),
   };
+  if (data.shiftLog) {
+    const history = buildHistoryIndex(data.shiftLog);
+    LIMIT_GROUPS.forEach((g) => attachFairnessWindow(workingMembers[g], g, history, year, month));
+  }
   const owed = {
     managers: new Set(data.tieBreakHistory.managers),
     forklift: new Set(data.tieBreakHistory.forklift),
@@ -1390,6 +1533,21 @@ function renderRosterStatus(data) {
   // 선택한 연·월에 "지난달 3회 근무로 1회만 배정"되는 사람 표시
   const limitsThisMonth = (data.tieBreakHistory.monthLimits || {})[ymKey(Number(yearSelectEl.value), Number(monthSelectEl.value))] || {};
   const limitTag = (groupKey, name) => ((limitsThisMonth[groupKey] || []).includes(name) ? '<span class="limit-tag">1회 제한</span>' : '');
+  // ScheduleLog가 연결돼 있으면 "최근 3개월" 칸을 함께 보여준다 (배정 순위의 기준이 되는 값)
+  const history = data.shiftLog ? buildHistoryIndex(data.shiftLog) : null;
+  const selYear = Number(yearSelectEl.value);
+  const selMonth = Number(monthSelectEl.value);
+  const recentCell = (groupKey, m) => {
+    if (!history) return '';
+    const prior = priorLoggedMonths(history, groupKey, selYear, selMonth);
+    const first = firstEligibleYm(m);
+    const usable = prior.filter((ym) => !first || ym >= first);
+    if (!usable.length) return '<td class="num">-</td>';
+    const byMonth = history.counts[groupKey].get(m.name);
+    const total = usable.reduce((sum, ym) => sum + ((byMonth && byMonth.get(ym)) || 0), 0);
+    const note = usable.length < 3 ? ` <span class="recent-note">(${usable.length}개월치)</span>` : '';
+    return `<td class="num">${total}${note}</td>`;
+  };
   const scopeSuffix = pools.length === 1 && pools[0].dept ? ` · ${pools[0].dept}` : '';
   const fieldScheduleWorkerNames = getScheduleWorkers(fieldScopeMembers).map((m) => m.name);
   const fieldTitle = fieldScheduleWorkerNames.length
@@ -1413,6 +1571,7 @@ function renderRosterStatus(data) {
         <tr>
           <td>${escapeHtml(m.name)}${limitTag(g.key, m.name)}${g.key === 'field' && m.fb ? '<span class="fb-tag">FB</span>' : ''}${g.key === 'field' && showDeptTag && m.dept ? `<span class="dept-tag">${escapeHtml(m.dept)}</span>` : ''}</td>
           <td class="num">${m.count}</td>
+          ${recentCell(g.key, m)}
           <td>${m.lastWorked || '-'}</td>
         </tr>`
         )
@@ -1421,7 +1580,7 @@ function renderRosterStatus(data) {
       <div class="roster-card">
         <h3>${escapeHtml(g.title)}</h3>
         <table class="roster-table">
-          <thead><tr><th>이름</th><th>누적</th><th>최근근무일</th></tr></thead>
+          <thead><tr><th>이름</th><th>누적</th>${history ? '<th title="직전 3개월(기록 있는 달) 근무 횟수">최근 3개월</th>' : ''}<th>최근근무일</th></tr></thead>
           <tbody>${rows}</tbody>
         </table>
       </div>`;
@@ -1562,6 +1721,12 @@ function applyCommitLocally(payload, data) {
     else tieBreakHistory[key] = names;
   });
   data.tieBreakHistory = tieBreakHistory;
+  if (data.shiftLog) {
+    (payload.scheduleLogRows || []).forEach((r) => {
+      const group = logGroupKey(r.group);
+      if (group && r.name && r.date) data.shiftLog.push({ date: r.date, group, name: r.name });
+    });
+  }
 }
 
 async function onCommit() {
