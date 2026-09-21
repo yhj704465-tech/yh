@@ -15,7 +15,7 @@
  *               모드 버튼: 풀필먼트2팀 = 두 부서 합산, 운영2 = 운영2 인원만)
  *   ※ 제외요일 : "일요일" / "토요일" 처럼 그 사람을 절대 배정하면 안 되는 요일. 없으면 빈칸.
  *              여러 개면 "토요일,일요일"처럼 쉼표로 구분.
- *   - tieBreakHistory : 그룹 | 이름
+ *   - tieBreakHistory : 그룹 | 이름   (그룹 칸이 "1회제한 2026-11 현장"이면 그 달 1회만 배정할 사람)
  *   - holidays : 날짜 | 설명
  * fieldConfigCsv (선택) : 현장 토/일 필요인원을 시트에서 관리하고 싶을 때만 채우기
  *   - 요일 | 부서 | 필요인원   (요일: "토"/"일". 부서 열이 없는 옛 형식도 읽는다.
@@ -151,7 +151,7 @@ const MOCK_DATA = {
       { name: '차은미(고은)', fb: false, count: 0, lastWorked: '', scheduleWorker: true },
     ],
   },
-  tieBreakHistory: { managers: [], forklift: [], field: [] },
+  tieBreakHistory: { managers: [], forklift: [], field: [], monthLimits: {} },
   holidays: new Map([
     ['2026-01-01', '신정'],
     ['2026-02-16', '설날연휴'], ['2026-02-17', '설날연휴'], ['2026-02-18', '설날연휴'],
@@ -175,6 +175,7 @@ function cloneMockData() {
       managers: [...MOCK_DATA.tieBreakHistory.managers],
       forklift: [...MOCK_DATA.tieBreakHistory.forklift],
       field: [...MOCK_DATA.tieBreakHistory.field],
+      monthLimits: {},
     },
     holidays: new Map(MOCK_DATA.holidays),
     warnings: [],
@@ -330,12 +331,46 @@ function mapGroupLabelToKey(v) {
   return null;
 }
 
+const LIMIT_ROW_PREFIX = '1회제한';
+const LIMIT_GROUP_LABELS = { managers: '관리자', forklift: '지게차', field: '현장' };
+const LIMIT_GROUPS = ['managers', 'forklift', 'field'];
+
+function ymKey(year, month) {
+  return `${year}-${String(month).padStart(2, '0')}`;
+}
+
+function nextYmKey(year, month) {
+  return month === 12 ? ymKey(year + 1, 1) : ymKey(year, month + 1);
+}
+
+/**
+ * TieBreakHistory 시트의 그룹 칸에 "1회제한 2026-11 현장" 처럼 적힌 행 = 그 달에 1회만 배정할 사람.
+ * (지난달에 3회 근무한 사람을 저장할 때 자동으로 적히고, 직접 적어도 된다)
+ */
+function parseLimitGroupLabel(label) {
+  const m = String(label || '').trim().match(/^1회제한\s+(\d{4})-(\d{1,2})\s+(.+)$/);
+  if (!m) return null;
+  const group = mapGroupLabelToKey(m[3]);
+  return group ? { ym: ymKey(Number(m[1]), Number(m[2])), group } : null;
+}
+
+function addMonthLimit(monthLimits, ym, group, name) {
+  if (!monthLimits[ym]) monthLimits[ym] = { managers: [], forklift: [], field: [] };
+  if (!monthLimits[ym][group].includes(name)) monthLimits[ym][group].push(name);
+}
+
 function parseTieBreakRows(rows) {
-  const result = { managers: [], forklift: [], field: [] };
+  const result = { managers: [], forklift: [], field: [], monthLimits: {} };
   rows.forEach((r) => {
-    const group = mapGroupLabelToKey(r['그룹']);
     const name = (r['이름'] || '').trim();
-    if (group && name) result[group].push(name);
+    if (!name) return;
+    const limit = parseLimitGroupLabel(r['그룹']);
+    if (limit) {
+      addMonthLimit(result.monthLimits, limit.ym, limit.group, name);
+      return;
+    }
+    const group = mapGroupLabelToKey(r['그룹']);
+    if (group) result[group].push(name);
   });
   return result;
 }
@@ -562,10 +597,26 @@ function countAlternationExceptions(selected, dow) {
   return selected.filter((m) => !isAlternationExempt(m) && alternationClass(m, dow) === 1).length;
 }
 
-function assignSingleSlot(members, date, dow, excludeNames, owedSet) {
-  const eligible = (m) => isEligible(m, date) && !excludeNames.has(m.name);
-  const ranked = rankCandidates(members, eligible, owedSet, dow);
-  const { selected, owedSet: newOwed, shortfall } = selectTopWithTieBreak(ranked, 1, owedSet, tieKeyFor(dow));
+/**
+ * 월 상한을 두 단계로 적용해서 뽑는다.
+ *   1단계: 평소 상한(softExclude 반영) 안에서만 뽑는다.
+ *   2단계: 1단계로 자리가 다 안 채워질 때만, 평소 상한에 걸린 사람 중에서 나머지를 뽑는다
+ *          (= 월 3회 근무는 정말 필요한 경우에만 생긴다).
+ * hardExclude(주말 연속 배정 금지, 최대 상한 도달 등)는 두 단계 모두 적용된다.
+ */
+function selectWithCapLadder(pool, needed, date, dow, hardExclude, softExclude, owedSet) {
+  const strict = (m) => isEligible(m, date) && !hardExclude.has(m.name) && !softExclude.has(m.name);
+  const first = selectTopWithTieBreak(rankCandidates(pool, strict, owedSet, dow), needed, owedSet, tieKeyFor(dow));
+  if (!first.shortfall) return first;
+
+  const taken = new Set(first.selected.map((m) => m.name));
+  const loose = (m) => isEligible(m, date) && !hardExclude.has(m.name) && !taken.has(m.name);
+  const second = selectTopWithTieBreak(rankCandidates(pool, loose, first.owedSet, dow), first.shortfall, first.owedSet, tieKeyFor(dow));
+  return { selected: [...first.selected, ...second.selected], owedSet: second.owedSet, shortfall: second.shortfall };
+}
+
+function assignSingleSlot(members, date, dow, hardExclude, softExclude, owedSet) {
+  const { selected, owedSet: newOwed, shortfall } = selectWithCapLadder(members, 1, date, dow, hardExclude, softExclude, owedSet);
   return {
     picked: selected.map((m) => m.name),
     owedSet: newOwed,
@@ -575,15 +626,14 @@ function assignSingleSlot(members, date, dow, excludeNames, owedSet) {
   };
 }
 
-function assignFieldDay(members, date, dow, requiredTotal, excludeNames, owedSet, label) {
+function assignFieldDay(members, date, dow, requiredTotal, hardExclude, softExclude, owedSet, label) {
   const scheduleWorkers = getScheduleWorkers(members); // 고정근무자는 로테이션 대상 아님, 매일 자동 포함
   const rotationPool = members.filter((m) => !m.scheduleWorker);
   const rotationNeeded = Math.max(0, requiredTotal - scheduleWorkers.length);
-  const eligible = (m) => isEligible(m, date) && !excludeNames.has(m.name);
 
-  // 요일 교대 → 누적횟수 → 최근근무일 → 동률이력 순으로만 뽑는다.
-  const { selected, owedSet: newOwed, shortfall } = selectTopWithTieBreak(
-    rankCandidates(rotationPool, eligible, owedSet, dow), rotationNeeded, owedSet, tieKeyFor(dow)
+  // 누적횟수(교대 반영) → 최근근무일 → 동률이력 순으로 뽑고, 월 상한은 2단계로 적용한다.
+  const { selected, owedSet: newOwed, shortfall } = selectWithCapLadder(
+    rotationPool, rotationNeeded, date, dow, hardExclude, softExclude, owedSet
   );
 
   const warnings = [];
@@ -631,10 +681,13 @@ function computeWeekendExclusion(prevEntry, dow, date, group, data) {
   return namesWithLastWorked(data[group].members, previousDayIso(date));
 }
 
-// 한 사람이 한 달에 배정될 수 있는 최대 횟수 (그룹별 독립).
-// 지게차는 인원이 5명뿐이라 2회로 두면 여유가 전혀 없어서(5명×2=10자리인데
-// 토·일 합쳐 10일까지 있는 달엔 규칙9와 맞물려 못 채우는 날이 생김) 3회로 둔다.
-const MONTHLY_CAP_BY_GROUP = { managers: 2, forklift: 3, field: 2 };
+// 한 사람이 한 달에 배정될 수 있는 횟수 (관리자·지게차·현장 모두 동일).
+//  - 평소 상한 2회: 먼저 이 안에서만 배정한다.
+//  - 최대 3회: 2회 안에서는 자리를 못 채울 때만 예외로 허용한다 (드물어야 한다).
+//  - 지난달에 3회 이상 근무한 사람은 이번 달 1회만 (신규 입사자의 첫 배정 달도 1회).
+const MONTHLY_SOFT_CAP = 2;
+const MONTHLY_MAX_CAP = 3;
+const LIMITED_MONTH_CAP = 1;
 
 /** 입사 후 유예기간(기본 1개월)이 끝나 처음 배정 대상에 들어가는 바로 그 달인지 */
 function isFirstEligibleMonth(member, year, month) {
@@ -643,14 +696,17 @@ function isFirstEligibleMonth(member, year, month) {
   return graceDate.getFullYear() === year && graceDate.getMonth() === month - 1;
 }
 
-function namesAtMonthlyCap(monthlyMap, group, members, year, month) {
-  const groupCap = MONTHLY_CAP_BY_GROUP[group];
+/** tier: 'soft' = 평소 상한(2회), 'max' = 최대 상한(3회) */
+function monthlyCapFor(member, year, month, limitedNames, tier) {
+  if (member && (limitedNames.has(member.name) || isFirstEligibleMonth(member, year, month))) return LIMITED_MONTH_CAP;
+  return tier === 'max' ? MONTHLY_MAX_CAP : MONTHLY_SOFT_CAP;
+}
+
+function namesAtMonthlyCap(monthlyMap, members, year, month, limitedNames, tier) {
   const memberByName = new Map(members.map((m) => [m.name, m]));
   const result = new Set();
   monthlyMap.forEach((c, name) => {
-    const member = memberByName.get(name);
-    // 신규 입사자는 처음 배정 대상이 되는 달엔 그룹 상한 대신 1회로 더 천천히 적응시킨다.
-    const cap = member && isFirstEligibleMonth(member, year, month) ? 1 : groupCap;
+    const cap = monthlyCapFor(memberByName.get(name), year, month, limitedNames, tier);
     if (c >= cap) result.add(name);
   });
   return result;
@@ -716,9 +772,16 @@ function generateMonthSchedule(year, month, data, mode = currentMode) {
     forklift: new Set(data.tieBreakHistory.forklift),
     field: new Set(data.tieBreakHistory.field),
   };
-  // 이번 달 동안 각 사람이 몇 번 배정됐는지 — 월별 상한(2회) 체크용.
+  // 이번 달 동안 각 사람이 몇 번 배정됐는지 — 월별 상한 체크용.
   // 고정근무자는 상한 대상이 아니라서 애초에 여기 안 쌓는다.
   const monthlyPicks = { managers: new Map(), forklift: new Map(), field: new Map() };
+  // 지난달에 3회 이상 근무해서 이번 달엔 1회만 배정할 사람 (TieBreakHistory 시트의 "1회제한" 행)
+  const limitsThisMonth = (data.tieBreakHistory.monthLimits || {})[ymKey(year, month)] || {};
+  const limited = {
+    managers: new Set(limitsThisMonth.managers || []),
+    forklift: new Set(limitsThisMonth.forklift || []),
+    field: new Set(limitsThisMonth.field || []),
+  };
   const fieldScheduleWorkerNames = getScheduleWorkerNameSet(data.field.members);
   const pools = getFieldPools(data, mode);
   const stats = { altTotal: 0, altExceptions: 0 }; // 요일 교대 규칙을 지킨 건수/예외 건수
@@ -746,27 +809,26 @@ function generateMonthSchedule(year, month, data, mode = currentMode) {
     }
 
     const prevEntry = dow === 'sun' ? days[days.length - 1] : null;
-    const excludeManagers = new Set([
-      ...computeWeekendExclusion(prevEntry, dow, date, 'managers', data),
-      ...namesAtMonthlyCap(monthlyPicks.managers, 'managers', workingMembers.managers, year, month),
-    ]);
-    const excludeForklift = new Set([
-      ...computeWeekendExclusion(prevEntry, dow, date, 'forklift', data),
-      ...namesAtMonthlyCap(monthlyPicks.forklift, 'forklift', workingMembers.forklift, year, month),
-    ]);
-    const excludeField = new Set([
-      ...computeWeekendExclusion(prevEntry, dow, date, 'field', data),
-      ...namesAtMonthlyCap(monthlyPicks.field, 'field', workingMembers.field, year, month),
-    ]);
+    // 그룹별 제외 명단: hard = 절대 못 뽑음(주말 연속·최대 상한), soft = 평소 상한에 걸려 마지막 수단으로만 뽑음
+    const exclusionsFor = (group) => ({
+      hard: new Set([
+        ...computeWeekendExclusion(prevEntry, dow, date, group, data),
+        ...namesAtMonthlyCap(monthlyPicks[group], workingMembers[group], year, month, limited[group], 'max'),
+      ]),
+      soft: namesAtMonthlyCap(monthlyPicks[group], workingMembers[group], year, month, limited[group], 'soft'),
+    });
+    const exMgr = exclusionsFor('managers');
+    const exFk = exclusionsFor('forklift');
+    const exField = exclusionsFor('field');
 
-    const mgrResult = assignSingleSlot(workingMembers.managers, date, dow, excludeManagers, owed.managers);
+    const mgrResult = assignSingleSlot(workingMembers.managers, date, dow, exMgr.hard, exMgr.soft, owed.managers);
     entry.managers = mgrResult.picked;
     owed.managers = mgrResult.owedSet;
     if (mgrResult.shortfall) entry.warnings.push(`관리자 인원 부족 (${mgrResult.shortfall}명 미배정)`);
     stats.altTotal += mgrResult.altTotal;
     stats.altExceptions += mgrResult.altExceptions;
 
-    const fkResult = assignSingleSlot(workingMembers.forklift, date, dow, excludeForklift, owed.forklift);
+    const fkResult = assignSingleSlot(workingMembers.forklift, date, dow, exFk.hard, exFk.soft, owed.forklift);
     entry.forklift = fkResult.picked;
     owed.forklift = fkResult.owedSet;
     if (fkResult.shortfall) entry.warnings.push(`지게차 인원 부족 (${fkResult.shortfall}명 미배정)`);
@@ -778,7 +840,7 @@ function generateMonthSchedule(year, month, data, mode = currentMode) {
       const required = dow === 'sat' ? pool.requiredSat : pool.requiredSun;
       const label = pool.dept ? `현장(${pool.dept})` : '현장';
       const fieldResult = assignFieldDay(
-        poolMembers, date, dow, required, excludeField, owed.field, label
+        poolMembers, date, dow, required, exField.hard, exField.soft, owed.field, label
       );
       entry.fieldByDept[pool.key] = fieldResult.picked;
       owed.field = fieldResult.owedSet;
@@ -799,7 +861,11 @@ function generateMonthSchedule(year, month, data, mode = currentMode) {
     days.push(entry);
   }
 
-  return { days, owed, workingMembers, pools, mode, stats };
+  const toNames = (set) => Array.from(set);
+  return {
+    days, owed, workingMembers, pools, mode, stats, year, month,
+    limited: { managers: toNames(limited.managers), forklift: toNames(limited.forklift), field: toNames(limited.field) },
+  };
 }
 
 /* ============================================================
@@ -930,7 +996,21 @@ function renderSchedule(draft, data) {
   });
   html += '</tr></thead><tbody>';
 
+  // 수정까지 반영한 현재 배정표에서, 월 3번째 이상 근무가 되는 날에 참고 표시를 붙인다
+  const skipField = getScheduleWorkerNameSet(data.field.members);
+  const runTally = { managers: new Map(), forklift: new Map(), field: new Map() };
+
   draft.days.forEach((day, dayIdx) => {
+    const notes = [];
+    if (!day.isHoliday) {
+      LIMIT_GROUPS.forEach((g) => {
+        day[g].filter((name) => name && !(g === 'field' && skipField.has(name))).forEach((name) => {
+          const c = (runTally[g].get(name) || 0) + 1;
+          runTally[g].set(name, c);
+          if (c >= MONTHLY_MAX_CAP) notes.push(`${name} 이번 달 ${c}번째 근무`);
+        });
+      });
+    }
     const weekdayLabel = day.dow === 'sat' ? '토' : '일';
     const rowClass = day.isHoliday ? 'is-holiday' : '';
     const dateCellClass = day.isHoliday ? 'date-cell holiday-text' : 'date-cell';
@@ -957,9 +1037,10 @@ function renderSchedule(draft, data) {
     }
     html += '</tr>';
 
-    if (!day.isHoliday && day.warnings.length) {
+    if (!day.isHoliday && (day.warnings.length || notes.length)) {
       html += `<tr class="${rowClass}"><td></td><td colspan="${1 + fieldCols}">`;
       html += day.warnings.map((w) => `<span class="warn-tag">${escapeHtml(w)}</span>`).join(' ');
+      html += notes.map((n) => `<span class="note-tag">${escapeHtml(n)}</span>`).join(' ');
       html += '</td></tr>';
     }
   });
@@ -1052,6 +1133,46 @@ function renderRosterStatus(data) {
 /* ============================================================
  * 저장 (Apps Script POST) / 엑셀 다운로드
  * ============================================================ */
+/** 화면에 보이는(수정까지 반영된) 배정표 기준으로 그룹별 "이번 달 몇 번 근무" 집계 */
+function computeMonthlyTallies(draft, data) {
+  const skipField = getScheduleWorkerNameSet(data.field.members);
+  const tallies = { managers: new Map(), forklift: new Map(), field: new Map() };
+  draft.days.forEach((day) => {
+    if (day.isHoliday) return;
+    LIMIT_GROUPS.forEach((g) => {
+      day[g]
+        .filter((name) => name && !(g === 'field' && skipField.has(name)))
+        .forEach((name) => tallies[g].set(name, (tallies[g].get(name) || 0) + 1));
+    });
+  });
+  return tallies;
+}
+
+/** 이번 달 3회 이상 근무한 사람 (그룹별 [{name, count}]) */
+function findMaxedOut(tallies) {
+  const out = {};
+  LIMIT_GROUPS.forEach((g) => {
+    out[g] = Array.from(tallies[g].entries())
+      .filter(([, c]) => c >= MONTHLY_MAX_CAP)
+      .map(([name, count]) => ({ name, count }));
+  });
+  return out;
+}
+
+/**
+ * 저장 시 다음 달 "1회제한" 명단을 갱신한다. 이번 달 3회 근무자를 다음 달에 추가하고,
+ * 이미 지난 달 항목은 정리하며, 직접 적어둔 이후 달 항목은 그대로 둔다.
+ */
+function mergeMonthLimits(existing, draftYm, targetYm, maxedOut) {
+  const out = {};
+  Object.entries(existing || {}).forEach(([ym, groups]) => {
+    if (ym <= draftYm) return;
+    LIMIT_GROUPS.forEach((g) => (groups[g] || []).forEach((name) => addMonthLimit(out, ym, g, name)));
+  });
+  LIMIT_GROUPS.forEach((g) => maxedOut[g].forEach(({ name }) => addMonthLimit(out, targetYm, g, name)));
+  return out;
+}
+
 function bumpDelta(map, name, iso) {
   const cur = map.get(name) || { count: 0, maxDate: '' };
   cur.count += 1;
@@ -1103,15 +1224,26 @@ function buildCommitPayload(draft, data) {
       .filter(Boolean);
   });
 
-  return {
-    rosterUpdates,
-    scheduleLogRows,
-    tieBreakHistory: {
-      managers: Array.from(draft.owed.managers),
-      forklift: Array.from(draft.owed.forklift),
-      field: Array.from(draft.owed.field),
-    },
+  // 이번 달 3회 이상 근무한 사람은 다음 달 1회만 배정하도록 TieBreakHistory에 "1회제한" 행으로 남긴다.
+  // (시트 구조·Apps Script는 그대로 — 그룹 칸에 "1회제한 2026-11 현장"처럼 적는다)
+  const year = draft.year || Number(draft.days[0].date.slice(0, 4));
+  const month = draft.month || Number(draft.days[0].date.slice(5, 7));
+  const monthLimits = mergeMonthLimits(
+    data.tieBreakHistory.monthLimits, ymKey(year, month), nextYmKey(year, month),
+    findMaxedOut(computeMonthlyTallies(draft, data))
+  );
+  const tieBreakHistory = {
+    managers: Array.from(draft.owed.managers),
+    forklift: Array.from(draft.owed.forklift),
+    field: Array.from(draft.owed.field),
   };
+  Object.entries(monthLimits).forEach(([ym, groups]) => {
+    LIMIT_GROUPS.forEach((g) => {
+      if (groups[g].length) tieBreakHistory[`${LIMIT_ROW_PREFIX} ${ym} ${LIMIT_GROUP_LABELS[g]}`] = groups[g];
+    });
+  });
+
+  return { rosterUpdates, scheduleLogRows, tieBreakHistory };
 }
 
 function applyCommitLocally(payload, data) {
@@ -1124,7 +1256,13 @@ function applyCommitLocally(payload, data) {
       }
     });
   });
-  data.tieBreakHistory = payload.tieBreakHistory;
+  const tieBreakHistory = { managers: [], forklift: [], field: [], monthLimits: {} };
+  Object.entries(payload.tieBreakHistory).forEach(([key, names]) => {
+    const limit = parseLimitGroupLabel(key);
+    if (limit) names.forEach((name) => addMonthLimit(tieBreakHistory.monthLimits, limit.ym, limit.group, name));
+    else tieBreakHistory[key] = names;
+  });
+  data.tieBreakHistory = tieBreakHistory;
 }
 
 async function onCommit() {
@@ -1409,10 +1547,16 @@ function onGenerate() {
   document.getElementById('btnExport').disabled = false;
   document.getElementById('btnHandout').disabled = false;
   const { altTotal, altExceptions } = currentDraft.stats;
+  const groupLabel = { managers: '관리자', forklift: '지게차', field: '현장' };
+  const maxed = findMaxedOut(computeMonthlyTallies(currentDraft, DATA));
+  const maxedText = LIMIT_GROUPS.flatMap((g) => maxed[g].map((x) => `${x.name}(${groupLabel[g]} ${x.count}회)`)).join(', ');
+  const limitedText = LIMIT_GROUPS.flatMap((g) => currentDraft.limited[g].map((n) => `${n}(${groupLabel[g]})`)).join(', ');
+  const capMsg = (maxedText ? ` 인원이 모자라 월 ${MONTHLY_MAX_CAP}회 근무가 된 사람: ${maxedText} — 저장하면 다음 달엔 1회만 배정됩니다.` : '')
+    + (limitedText ? ` 지난달 ${MONTHLY_MAX_CAP}회 근무로 이번 달 1회만 배정한 사람: ${limitedText}.` : '');
   const altMsg = altExceptions
     ? ` 요일 교대 예외 ${altExceptions}/${altTotal}건 (인원이 모자라 같은 요일을 연속 배정).`
     : '';
-  setStatus(`[${getModeLabel(currentMode)}] 배정표를 생성했습니다.${altMsg} 저장 전에 검토해주세요.`, 'success');
+  setStatus(`[${getModeLabel(currentMode)}] 배정표를 생성했습니다.${altMsg}${capMsg} 저장 전에 검토해주세요.`, 'success');
 }
 
 function updateModeButtons() {
