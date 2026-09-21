@@ -414,17 +414,6 @@ select:focus {
   font-size: 0.74rem;
   font-weight: 600;
 }
-.note-tag {
-  display: inline-block;
-  margin-top: 4px;
-  padding: 3px 8px;
-  border-radius: 999px;
-  background: var(--surface-alt);
-  border: 1px solid var(--border);
-  color: var(--text-muted);
-  font-size: 0.74rem;
-  font-weight: 600;
-}
 .holiday-row-label {
   color: var(--holiday-blue);
   font-weight: 700;
