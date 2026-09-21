@@ -71,7 +71,13 @@
 
   <section class="panel">
     <h2>배정표 미리보기</h2>
-    <p class="hint">각 슬롯을 클릭하면 같은 그룹의 다른 배정 가능 인원으로 바꿀 수 있고, 바쁜 날은 그룹 칸 옆의 "+" 버튼으로 근무 칸을 더 늘릴 수 있습니다(추가한 칸 옆 ×로 삭제). 수정은 저장 전 화면에만 반영되며, 이후 날짜의 자동배정에는 영향을 주지 않습니다.</p>
+    <p class="hint">각 슬롯을 클릭하면 같은 그룹의 다른 배정 가능 인원으로 바꿀 수 있고, 바쁜 날은 그룹 칸 옆의 "+" 버튼으로 근무 칸을 더 늘릴 수 있습니다(추가한 칸 옆 ×로 삭제). 직접 고른 칸은 자동으로 🔒 고정되고, 마음에 드는 칸을 고정한 뒤 "고정 제외 다시 배정"을 누르면 나머지만 다시 배정합니다. 수정은 저장 전 화면에만 반영되며, 이후 날짜의 자동배정에는 영향을 주지 않습니다.</p>
+    <div id="scheduleToolbar" class="schedule-toolbar" hidden>
+      <button id="btnReassign" class="btn btn-primary btn-sm" type="button" title="자물쇠로 고정한 칸은 그대로 두고, 나머지 칸만 공평 규칙으로 다시 배정합니다">고정 제외 다시 배정</button>
+      <button id="btnLockAll" class="btn btn-ghost btn-sm" type="button">전체 고정</button>
+      <button id="btnUnlockAll" class="btn btn-ghost btn-sm" type="button">전체 해제</button>
+      <span id="lockCount" class="lock-count"></span>
+    </div>
     <div id="scheduleContainer" class="schedule-container">
       <p class="empty-hint">연도/월을 선택하고 "자동배정 생성"을 눌러주세요.</p>
     </div>

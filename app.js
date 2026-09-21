@@ -682,8 +682,9 @@ function assignGroupDay(members, date, dow, needed, hardExclude, tierExcludes, o
   };
 }
 
-function assignFieldDay(members, date, dow, requiredTotal, hardExclude, tierExcludes, owedSet, label) {
-  const scheduleWorkers = getScheduleWorkers(members); // 고정근무자는 로테이션 대상 아님, 매일 자동 포함
+function assignFieldDay(members, date, dow, requiredTotal, hardExclude, tierExcludes, owedSet, label, lockedNames = []) {
+  // 고정근무자는 로테이션 대상 아님, 매일 자동 포함 (이미 사람이 칸에 고정해 둔 경우는 다시 넣지 않는다)
+  const scheduleWorkers = getScheduleWorkers(members).filter((m) => !lockedNames.includes(m.name));
   const rotationPool = members.filter((m) => !m.scheduleWorker);
   const rotationNeeded = Math.max(0, requiredTotal - scheduleWorkers.length);
 
@@ -824,7 +825,51 @@ function syncFlatField(entry, pools) {
   entry.field = pools.flatMap((p) => entry.fieldByDept[p.key] || []);
 }
 
-function generateMonthSchedule(year, month, data, mode = currentMode) {
+/* ------------------------------------------------------------
+ * 칸 고정 — 미리보기에서 마음에 드는 칸을 고정해 두면, "고정 제외 다시 배정"이 고정한 칸은
+ * 그대로 두고 나머지 칸만 (고정된 사람의 근무 횟수까지 반영해서) 다시 공평하게 배정한다.
+ * day.locks = { managers: [bool], forklift: [bool], field: { 부서키: [bool] } } — 칸 순서와 같은 위치.
+ * ------------------------------------------------------------ */
+function getSlotLocks(day, group, poolKey) {
+  const l = day.locks;
+  if (!l) return [];
+  return group === 'field' ? ((l.field && l.field[poolKey]) || []) : (l[group] || []);
+}
+
+function ensureSlotLocks(day, group, poolKey) {
+  if (!day.locks) day.locks = { managers: [], forklift: [], field: {} };
+  if (group !== 'field') {
+    if (!day.locks[group]) day.locks[group] = [];
+    return day.locks[group];
+  }
+  if (!day.locks.field) day.locks.field = {};
+  if (!day.locks.field[poolKey]) day.locks.field[poolKey] = [];
+  return day.locks.field[poolKey];
+}
+
+/**
+ * 이전 배정표(prev)의 그 날짜·그룹 칸 정보 — 총 칸 수(n: "+"로 늘린 칸 포함)와,
+ * 고정된 칸의 이름(고정 안 된 칸은 빈 문자열). prev가 없으면(처음부터 만들 때) null.
+ */
+function planSlots(prevDay, group, poolKey, required) {
+  if (!prevDay) return null;
+  const list = group === 'field' ? (prevDay.fieldByDept[poolKey] || []) : (prevDay[group] || []);
+  const locks = getSlotLocks(prevDay, group, poolKey);
+  const n = Math.max(required, list.length);
+  return { n, locked: Array.from({ length: n }, (_, i) => (locks[i] && list[i] ? list[i] : '')) };
+}
+
+/** 고정된 칸은 그 자리에 두고, 나머지 칸을 새로 뽑은 사람으로 앞에서부터 채운다 */
+function fillSlots(plan, picked) {
+  if (!plan) return picked;
+  const out = plan.locked.slice();
+  let k = 0;
+  for (let i = 0; i < out.length; i++) if (!out[i]) out[i] = picked[k++] || '';
+  return out;
+}
+
+function generateMonthSchedule(year, month, data, mode = currentMode, prev = null) {
+  const prevByDate = prev ? new Map(prev.days.map((d) => [d.date, d])) : null;
   const dates = getWeekendDatesInMonth(year, month);
   const workingMembers = {
     managers: cloneMembers(data.managers.members),
@@ -886,15 +931,35 @@ function generateMonthSchedule(year, month, data, mode = currentMode) {
     const exFk = exclusionsFor('forklift');
     const exField = exclusionsFor('field');
 
-    const mgrResult = assignGroupDay(workingMembers.managers, date, dow, getGroupRequired(data, 'managers', dow), exMgr.hard, exMgr.tiers, owed.managers);
-    entry.managers = mgrResult.picked;
+    // 다시 배정할 때: 이전 표에서 고정한 칸의 사람은 그대로 두고(횟수·주말 제한에는 그대로 반영),
+    // 고정 안 된 칸 수만큼만 새로 뽑는다. 칸 수는 "+"로 늘린 것까지 이전 표를 따른다.
+    const prevDay = prevByDate ? prevByDate.get(iso) : null;
+    const lockFlags = { managers: [], forklift: [], field: {} };
+    const asLockedSet = (base, names) => new Set([...base, ...names]);
+
+    const requiredM = getGroupRequired(data, 'managers', dow);
+    const planM = planSlots(prevDay, 'managers', '', requiredM);
+    const lockedM = planM ? planM.locked.filter(Boolean) : [];
+    const mgrResult = assignGroupDay(
+      workingMembers.managers, date, dow, planM ? planM.n - lockedM.length : requiredM,
+      asLockedSet(exMgr.hard, lockedM), exMgr.tiers, owed.managers
+    );
+    entry.managers = fillSlots(planM, mgrResult.picked);
+    lockFlags.managers = planM ? planM.locked.map(Boolean) : [];
     owed.managers = mgrResult.owedSet;
     if (mgrResult.shortfall) entry.warnings.push(`관리자 인원 부족 (${mgrResult.shortfall}명 미배정)`);
     stats.altTotal += mgrResult.altTotal;
     stats.altExceptions += mgrResult.altExceptions;
 
-    const fkResult = assignGroupDay(workingMembers.forklift, date, dow, getGroupRequired(data, 'forklift', dow), exFk.hard, exFk.tiers, owed.forklift);
-    entry.forklift = fkResult.picked;
+    const requiredF = getGroupRequired(data, 'forklift', dow);
+    const planF = planSlots(prevDay, 'forklift', '', requiredF);
+    const lockedF = planF ? planF.locked.filter(Boolean) : [];
+    const fkResult = assignGroupDay(
+      workingMembers.forklift, date, dow, planF ? planF.n - lockedF.length : requiredF,
+      asLockedSet(exFk.hard, lockedF), exFk.tiers, owed.forklift
+    );
+    entry.forklift = fillSlots(planF, fkResult.picked);
+    lockFlags.forklift = planF ? planF.locked.map(Boolean) : [];
     owed.forklift = fkResult.owedSet;
     if (fkResult.shortfall) entry.warnings.push(`지게차 인원 부족 (${fkResult.shortfall}명 미배정)`);
     stats.altTotal += fkResult.altTotal;
@@ -904,16 +969,21 @@ function generateMonthSchedule(year, month, data, mode = currentMode) {
       const poolMembers = workingMembers.field.filter((m) => poolIncludes(pool, m));
       const required = dow === 'sat' ? pool.requiredSat : pool.requiredSun;
       const label = pool.dept ? `현장(${pool.dept})` : '현장';
+      const planW = planSlots(prevDay, 'field', pool.key, required);
+      const lockedW = planW ? planW.locked.filter(Boolean) : [];
       const fieldResult = assignFieldDay(
-        poolMembers, date, dow, required, exField.hard, exField.tiers, owed.field, label
+        poolMembers, date, dow, planW ? planW.n - lockedW.length : required,
+        asLockedSet(exField.hard, lockedW), exField.tiers, owed.field, label, lockedW
       );
-      entry.fieldByDept[pool.key] = fieldResult.picked;
+      entry.fieldByDept[pool.key] = fillSlots(planW, fieldResult.picked);
+      lockFlags.field[pool.key] = planW ? planW.locked.map(Boolean) : [];
       owed.field = fieldResult.owedSet;
       entry.warnings.push(...fieldResult.warnings);
       stats.altTotal += fieldResult.altTotal;
       stats.altExceptions += fieldResult.altExceptions;
     });
     syncFlatField(entry, pools);
+    if (prevDay) entry.locks = lockFlags;
 
     bumpWorkingMembers(workingMembers.managers, entry.managers, iso);
     bumpWorkingMembers(workingMembers.forklift, entry.forklift, iso);
@@ -992,6 +1062,7 @@ function resetDraftUi(clearStatus = true) {
   document.getElementById('btnCommit').disabled = true;
   document.getElementById('btnExport').disabled = true;
   document.getElementById('btnHandout').disabled = true;
+  updateScheduleToolbar(null);
   if (clearStatus) setStatus('', '');
 }
 
@@ -1046,7 +1117,8 @@ function renderSlotSelect(draft, dayIdx, group, slotIndex, data, pool) {
     .join('');
 
   const poolAttr = group === 'field' && pool ? ` data-pool-key="${escapeHtml(pool.key)}"` : '';
-  return `<select class="slot-select" data-day-idx="${dayIdx}" data-group="${group}" data-slot-index="${slotIndex}"${poolAttr}>${blankOpt}${optsHtml}</select>`;
+  const locked = !!(currentName && getSlotLocks(day, group, pool ? pool.key : '')[slotIndex]);
+  return `<select class="slot-select${locked ? ' is-locked' : ''}" data-day-idx="${dayIdx}" data-group="${group}" data-slot-index="${slotIndex}"${poolAttr}>${blankOpt}${optsHtml}</select>`;
 }
 
 /**
@@ -1097,6 +1169,13 @@ function renderSchedule(draft, data) {
   const groupLabelOf = (group, pool) => (group === 'managers' ? '관리자' : group === 'forklift' ? '지게차' : (pool && pool.dept ? `${pool.dept} 현장` : '현장'));
   const addBtn = (dayIdx, group, i, pool) =>
     `<button type="button" class="slot-add" title="${escapeHtml(groupLabelOf(group, pool))} 근무 칸 추가 (바쁜 날)" aria-label="${escapeHtml(groupLabelOf(group, pool))} 근무 칸 추가" ${dataAttrs(dayIdx, group, i, pool)}>+</button>`;
+  const lockBtn = (dayIdx, group, i, pool) => {
+    const day = draft.days[dayIdx];
+    if (!getSlotName(day, group, i, pool)) return ''; // 비어 있는 칸은 고정할 수 없다
+    const locked = !!getSlotLocks(day, group, pool ? pool.key : '')[i];
+    const tip = locked ? '고정됨 — 다시 배정해도 바뀌지 않습니다 (눌러서 해제)' : '눌러서 이 칸을 고정 (다시 배정해도 바뀌지 않음)';
+    return `<button type="button" class="slot-lock${locked ? ' is-locked' : ''}" aria-pressed="${locked}" title="${tip}" aria-label="${tip}" ${dataAttrs(dayIdx, group, i, pool)}>${locked ? '🔒' : '🔓'}</button>`;
+  };
   const removeBtn = (dayIdx, group, i, pool) =>
     `<button type="button" class="slot-remove" title="추가한 칸 삭제" aria-label="추가한 칸 삭제" ${dataAttrs(dayIdx, group, i, pool)}>×</button>`;
   const groupCells = (dayIdx, group, list, required, colCount, pool) => {
@@ -1110,7 +1189,7 @@ function renderSchedule(draft, data) {
         continue;
       }
       const extra = i >= required;
-      out += `<td><div class="slot-wrap">${renderSlotSelect(draft, dayIdx, group, i, data, pool)}${extra ? removeBtn(dayIdx, group, i, pool) : ''}${addHere ? addBtn(dayIdx, group, i, pool) : ''}</div></td>`;
+      out += `<td><div class="slot-wrap">${renderSlotSelect(draft, dayIdx, group, i, data, pool)}${lockBtn(dayIdx, group, i, pool)}${extra ? removeBtn(dayIdx, group, i, pool) : ''}${addHere ? addBtn(dayIdx, group, i, pool) : ''}</div></td>`;
     }
     return out;
   };
@@ -1170,6 +1249,8 @@ function renderSchedule(draft, data) {
   });
   container.querySelectorAll('button.slot-add').forEach((b) => b.addEventListener('click', onSlotAdd));
   container.querySelectorAll('button.slot-remove').forEach((b) => b.addEventListener('click', onSlotRemove));
+  container.querySelectorAll('button.slot-lock').forEach((b) => b.addEventListener('click', onSlotLockToggle));
+  updateScheduleToolbar(draft);
 }
 
 /** 그 날짜·그룹의 배정 목록(배열)과 그날 자동배정이 정한 필요인원 */
@@ -1183,6 +1264,61 @@ function getDaySlotList(day, group, poolKey) {
   const gr = currentDraft.groupRequired || { managers: DEFAULT_GROUP_REQUIRED, forklift: DEFAULT_GROUP_REQUIRED };
   const required = day.dow === 'sat' ? gr[group].sat : gr[group].sun;
   return { slots: day[group], required, label: group === 'managers' ? '관리자' : '지게차' };
+}
+
+/** 고정된(사람 이름이 있는) 칸 수 */
+function countLockedSlots(draft) {
+  let n = 0;
+  draft.days.forEach((day) => {
+    if (day.isHoliday) return;
+    ['managers', 'forklift'].forEach((g) => day[g].forEach((name, i) => { if (name && getSlotLocks(day, g, '')[i]) n += 1; }));
+    draft.pools.forEach((pool) => (day.fieldByDept[pool.key] || []).forEach((name, i) => {
+      if (name && getSlotLocks(day, 'field', pool.key)[i]) n += 1;
+    }));
+  });
+  return n;
+}
+
+/** 배정표 위 도구줄(다시 배정 / 전체 고정 / 전체 해제)을 보여주고 고정 칸 수를 갱신 */
+function updateScheduleToolbar(draft) {
+  const bar = document.getElementById('scheduleToolbar');
+  if (!bar) return;
+  bar.hidden = !draft;
+  if (draft) document.getElementById('lockCount').textContent = `고정 ${countLockedSlots(draft)}칸`;
+}
+
+/** 자물쇠 버튼 — 그 칸을 고정/해제 */
+function onSlotLockToggle(evt) {
+  const btn = evt.currentTarget;
+  const day = currentDraft.days[Number(btn.dataset.dayIdx)];
+  const locks = ensureSlotLocks(day, btn.dataset.group, btn.dataset.poolKey || '');
+  const i = Number(btn.dataset.slotIndex);
+  locks[i] = !locks[i];
+  renderSchedule(currentDraft, DATA);
+}
+
+/** 전체 고정(사람이 들어 있는 모든 칸) / 전체 해제 */
+function setAllLocks(value) {
+  if (!currentDraft) return;
+  currentDraft.days.forEach((day) => {
+    if (day.isHoliday) return;
+    ['managers', 'forklift'].forEach((g) => day[g].forEach((name, i) => { ensureSlotLocks(day, g, '')[i] = value && !!name; }));
+    currentDraft.pools.forEach((pool) => (day.fieldByDept[pool.key] || []).forEach((name, i) => {
+      ensureSlotLocks(day, 'field', pool.key)[i] = value && !!name;
+    }));
+  });
+  renderSchedule(currentDraft, DATA);
+  setStatus(value ? '사람이 들어 있는 모든 칸을 고정했습니다. 바꾸고 싶은 칸의 자물쇠만 풀고 "고정 제외 다시 배정"을 눌러주세요.' : '모든 고정을 해제했습니다.', 'success');
+}
+
+/** "고정 제외 다시 배정" — 고정한 칸은 그대로 두고 나머지를 공평 규칙으로 다시 배정 */
+function onReassign() {
+  if (!currentDraft || !DATA) return;
+  const lockedBefore = countLockedSlots(currentDraft);
+  const mode = currentDraft.mode;
+  currentDraft = generateMonthSchedule(currentDraft.year, currentDraft.month, DATA, mode, currentDraft);
+  renderSchedule(currentDraft, DATA);
+  setStatus(`[${getModeLabel(mode)}] 고정한 ${lockedBefore}칸은 그대로 두고 나머지를 다시 배정했습니다.${draftSummaryMessage(currentDraft)} 저장 전에 검토해주세요.`, 'success');
 }
 
 /** "+ 버튼" — 바쁜 날에 근무 칸을 한 칸 더 늘린다 (추가한 칸은 미배정으로 시작) */
@@ -1205,6 +1341,7 @@ function onSlotRemove(evt) {
   const group = btn.dataset.group;
   const { slots, label } = getDaySlotList(day, group, btn.dataset.poolKey || '');
   slots.splice(Number(btn.dataset.slotIndex), 1);
+  ensureSlotLocks(day, group, btn.dataset.poolKey || '').splice(Number(btn.dataset.slotIndex), 1);
   if (group === 'field') syncFlatField(day, currentDraft.pools);
   renderSchedule(currentDraft, DATA);
   setStatus(`${formatKoreanDate(day.date)} ${label}의 추가한 칸을 삭제했습니다.`, 'success');
@@ -1225,8 +1362,10 @@ function onSlotChange(evt) {
   } else {
     day[group][slotIndex] = sel.value;
   }
+  // 직접 고른 칸은 자동으로 고정한다 (다시 배정해도 유지). 미배정으로 비우면 고정도 풀린다.
+  ensureSlotLocks(day, group, sel.dataset.poolKey || '')[slotIndex] = sel.value !== '';
   renderSchedule(currentDraft, DATA);
-  setStatus('슬롯을 수정했습니다. 이후 날짜의 자동배정에는 영향을 주지 않습니다.', 'success');
+  setStatus('칸을 수정하고 고정했습니다(자물쇠로 해제 가능). 나머지 칸을 다시 배정하려면 "고정 제외 다시 배정"을 누르세요.', 'success');
 }
 
 /** 시트 상태 경고(부서 미입력, 읽을 수 없는 날짜 등)를 배너로 보여준다 */
@@ -1702,23 +1841,16 @@ async function reloadData() {
   resetDraftUi(false);
 }
 
-function onGenerate() {
-  if (!DATA) return;
-  const year = Number(yearSelectEl.value);
-  const month = Number(monthSelectEl.value);
-  currentDraft = generateMonthSchedule(year, month, DATA, currentMode);
-  renderSchedule(currentDraft, DATA);
-  document.getElementById('btnCommit').disabled = false;
-  document.getElementById('btnExport').disabled = false;
-  document.getElementById('btnHandout').disabled = false;
-  const { altTotal, altExceptions } = currentDraft.stats;
+/** 자동배정/다시 배정 후 상태줄에 붙이는 요약 (교대 예외, 월 3회 근무자, 1회 제한 대상 안내) */
+function draftSummaryMessage(draft) {
+  const { altTotal, altExceptions } = draft.stats;
   const groupLabel = { managers: '관리자', forklift: '지게차', field: '현장' };
-  const maxed = findMaxedOut(computeMonthlyTallies(currentDraft, DATA));
+  const tallies = computeMonthlyTallies(draft, DATA);
+  const maxed = findMaxedOut(tallies);
   const maxedText = LIMIT_GROUPS.flatMap((g) => maxed[g].map((x) => `${x.name}(${groupLabel[g]} ${x.count}회)`)).join(', ');
-  const tallies = computeMonthlyTallies(currentDraft, DATA);
   const limitedOnce = [];
   const limitedTwice = [];
-  LIMIT_GROUPS.forEach((g) => currentDraft.limited[g].forEach((n) => {
+  LIMIT_GROUPS.forEach((g) => draft.limited[g].forEach((n) => {
     const label = `${n}(${groupLabel[g]})`;
     ((tallies[g].get(n) || 0) >= LIMITED_MONTH_MAX_CAP ? limitedTwice : limitedOnce).push(label);
   }));
@@ -1728,7 +1860,19 @@ function onGenerate() {
   const altMsg = altExceptions
     ? ` 요일 교대 예외 ${altExceptions}/${altTotal}건 (인원이 모자라 같은 요일을 연속 배정).`
     : '';
-  setStatus(`[${getModeLabel(currentMode)}] 배정표를 생성했습니다.${altMsg}${capMsg} 저장 전에 검토해주세요.`, 'success');
+  return `${altMsg}${capMsg}`;
+}
+
+function onGenerate() {
+  if (!DATA) return;
+  const year = Number(yearSelectEl.value);
+  const month = Number(monthSelectEl.value);
+  currentDraft = generateMonthSchedule(year, month, DATA, currentMode);
+  renderSchedule(currentDraft, DATA);
+  document.getElementById('btnCommit').disabled = false;
+  document.getElementById('btnExport').disabled = false;
+  document.getElementById('btnHandout').disabled = false;
+  setStatus(`[${getModeLabel(currentMode)}] 배정표를 생성했습니다.${draftSummaryMessage(currentDraft)} 저장 전에 검토해주세요.`, 'success');
 }
 
 function updateModeButtons() {
@@ -1762,6 +1906,9 @@ function initModeSwitch() {
 
 document.getElementById('btnReload').addEventListener('click', reloadData);
 document.getElementById('btnGenerate').addEventListener('click', onGenerate);
+document.getElementById('btnReassign').addEventListener('click', onReassign);
+document.getElementById('btnLockAll').addEventListener('click', () => setAllLocks(true));
+document.getElementById('btnUnlockAll').addEventListener('click', () => setAllLocks(false));
 document.getElementById('btnCommit').addEventListener('click', onCommit);
 document.getElementById('btnExport').addEventListener('click', onExport);
 document.getElementById('btnHandout').addEventListener('click', onHandoutDownload);

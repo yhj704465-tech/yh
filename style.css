@@ -398,6 +398,26 @@ select:focus {
   cursor: pointer;
 }
 .slot-remove:hover { background: var(--danger-soft); border-color: var(--danger); color: var(--danger-text); }
+.slot-lock {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 50%;
+  background: transparent;
+  font-size: 0.78rem;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.55;
+}
+.slot-lock:hover { opacity: 1; background: var(--accent-soft); }
+.slot-lock.is-locked { opacity: 1; background: var(--accent-soft); border-color: var(--accent); }
+.slot-select.is-locked { border-color: var(--accent); background: var(--accent-soft); }
+.schedule-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 4px 0 12px; }
+.schedule-toolbar[hidden] { display: none; }
+.btn-sm { padding: 7px 12px; font-size: 0.82rem; }
+.lock-count { font-size: 0.82rem; font-weight: 700; color: var(--accent-soft-text); margin-left: 4px; }
 .slot-dash { color: var(--text-faint); padding: 0 4px; }
 .slot-add {
   flex: none;
