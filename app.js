@@ -598,25 +598,34 @@ function countAlternationExceptions(selected, dow) {
 }
 
 /**
- * 월 상한을 두 단계로 적용해서 뽑는다.
- *   1단계: 평소 상한(softExclude 반영) 안에서만 뽑는다.
- *   2단계: 1단계로 자리가 다 안 채워질 때만, 평소 상한에 걸린 사람 중에서 나머지를 뽑는다
- *          (= 월 3회 근무는 정말 필요한 경우에만 생긴다).
- * hardExclude(주말 연속 배정 금지, 최대 상한 도달 등)는 두 단계 모두 적용된다.
+ * 월 상한을 단계적으로 풀어가며 뽑는다. 앞 단계로 자리가 다 채워지면 뒤 단계는 쓰지 않는다.
+ *   tierExcludes[0] : 평소 상한 (일반 2회 / 지난달 3회 한 사람 1회)
+ *   tierExcludes[1] : 1단계로 모자랄 때 — 지난달 3회 한 사람도 2회까지 (일반은 그대로 2회)
+ *   마지막        : 그래도 모자랄 때만 — 일반 인원이 3번째 근무 (hardExclude만 적용)
+ * hardExclude(주말 연속 배정 금지, 최대 상한 도달 등)는 모든 단계에 적용된다.
+ * 그래서 월 3회 근무는 정말 다른 방법이 없을 때만 생기고, 지난달 3회 한 사람이 2회가
+ * 되는 것도 인원이 안 맞을 때뿐이다.
  */
-function selectWithCapLadder(pool, needed, date, dow, hardExclude, softExclude, owedSet) {
-  const strict = (m) => isEligible(m, date) && !hardExclude.has(m.name) && !softExclude.has(m.name);
-  const first = selectTopWithTieBreak(rankCandidates(pool, strict, owedSet, dow), needed, owedSet, tieKeyFor(dow));
-  if (!first.shortfall) return first;
-
-  const taken = new Set(first.selected.map((m) => m.name));
-  const loose = (m) => isEligible(m, date) && !hardExclude.has(m.name) && !taken.has(m.name);
-  const second = selectTopWithTieBreak(rankCandidates(pool, loose, first.owedSet, dow), first.shortfall, first.owedSet, tieKeyFor(dow));
-  return { selected: [...first.selected, ...second.selected], owedSet: second.owedSet, shortfall: second.shortfall };
+function selectWithCapLadder(pool, needed, date, dow, hardExclude, tierExcludes, owedSet) {
+  const taken = new Set();
+  let selected = [];
+  let owed = owedSet;
+  let remaining = needed;
+  const stages = [...tierExcludes, new Set()];
+  for (const tierExclude of stages) {
+    if (remaining <= 0) break;
+    const eligible = (m) => isEligible(m, date) && !hardExclude.has(m.name) && !tierExclude.has(m.name) && !taken.has(m.name);
+    const step = selectTopWithTieBreak(rankCandidates(pool, eligible, owed, dow), remaining, owed, tieKeyFor(dow));
+    step.selected.forEach((m) => taken.add(m.name));
+    selected = selected.concat(step.selected);
+    owed = step.owedSet;
+    remaining = step.shortfall;
+  }
+  return { selected, owedSet: owed, shortfall: remaining };
 }
 
-function assignSingleSlot(members, date, dow, hardExclude, softExclude, owedSet) {
-  const { selected, owedSet: newOwed, shortfall } = selectWithCapLadder(members, 1, date, dow, hardExclude, softExclude, owedSet);
+function assignSingleSlot(members, date, dow, hardExclude, tierExcludes, owedSet) {
+  const { selected, owedSet: newOwed, shortfall } = selectWithCapLadder(members, 1, date, dow, hardExclude, tierExcludes, owedSet);
   return {
     picked: selected.map((m) => m.name),
     owedSet: newOwed,
@@ -626,14 +635,14 @@ function assignSingleSlot(members, date, dow, hardExclude, softExclude, owedSet)
   };
 }
 
-function assignFieldDay(members, date, dow, requiredTotal, hardExclude, softExclude, owedSet, label) {
+function assignFieldDay(members, date, dow, requiredTotal, hardExclude, tierExcludes, owedSet, label) {
   const scheduleWorkers = getScheduleWorkers(members); // 고정근무자는 로테이션 대상 아님, 매일 자동 포함
   const rotationPool = members.filter((m) => !m.scheduleWorker);
   const rotationNeeded = Math.max(0, requiredTotal - scheduleWorkers.length);
 
-  // 누적횟수(교대 반영) → 최근근무일 → 동률이력 순으로 뽑고, 월 상한은 2단계로 적용한다.
+  // 누적횟수(교대 반영) → 최근근무일 → 동률이력 순으로 뽑고, 월 상한은 단계적으로 푼다.
   const { selected, owedSet: newOwed, shortfall } = selectWithCapLadder(
-    rotationPool, rotationNeeded, date, dow, hardExclude, softExclude, owedSet
+    rotationPool, rotationNeeded, date, dow, hardExclude, tierExcludes, owedSet
   );
 
   const warnings = [];
@@ -684,10 +693,12 @@ function computeWeekendExclusion(prevEntry, dow, date, group, data) {
 // 한 사람이 한 달에 배정될 수 있는 횟수 (관리자·지게차·현장 모두 동일).
 //  - 평소 상한 2회: 먼저 이 안에서만 배정한다.
 //  - 최대 3회: 2회 안에서는 자리를 못 채울 때만 예외로 허용한다 (드물어야 한다).
-//  - 지난달에 3회 이상 근무한 사람은 이번 달 1회만 (신규 입사자의 첫 배정 달도 1회).
+//  - 지난달에 3회 이상 근무한 사람은 이번 달 1회만. 그래도 인원이 안 맞으면 어쩔 수 없이 2회까지.
+//  - 신규 입사자의 첫 배정 달은 무조건 1회.
 const MONTHLY_SOFT_CAP = 2;
 const MONTHLY_MAX_CAP = 3;
 const LIMITED_MONTH_CAP = 1;
+const LIMITED_MONTH_MAX_CAP = 2;
 
 /** 입사 후 유예기간(기본 1개월)이 끝나 처음 배정 대상에 들어가는 바로 그 달인지 */
 function isFirstEligibleMonth(member, year, month) {
@@ -696,9 +707,15 @@ function isFirstEligibleMonth(member, year, month) {
   return graceDate.getFullYear() === year && graceDate.getMonth() === month - 1;
 }
 
-/** tier: 'soft' = 평소 상한(2회), 'max' = 최대 상한(3회) */
+/**
+ * tier: 'soft' = 평소 상한, 'mid' = 지난달 3회 한 사람만 2회로 풀린 상태, 'max' = 절대 상한
+ *   일반 인원      soft 2 / mid 2 / max 3
+ *   지난달 3회한 사람 soft 1 / mid 2 / max 2
+ *   신규 입사 첫 달   항상 1
+ */
 function monthlyCapFor(member, year, month, limitedNames, tier) {
-  if (member && (limitedNames.has(member.name) || isFirstEligibleMonth(member, year, month))) return LIMITED_MONTH_CAP;
+  if (member && isFirstEligibleMonth(member, year, month)) return LIMITED_MONTH_CAP;
+  if (member && limitedNames.has(member.name)) return tier === 'soft' ? LIMITED_MONTH_CAP : LIMITED_MONTH_MAX_CAP;
   return tier === 'max' ? MONTHLY_MAX_CAP : MONTHLY_SOFT_CAP;
 }
 
@@ -809,26 +826,27 @@ function generateMonthSchedule(year, month, data, mode = currentMode) {
     }
 
     const prevEntry = dow === 'sun' ? days[days.length - 1] : null;
-    // 그룹별 제외 명단: hard = 절대 못 뽑음(주말 연속·최대 상한), soft = 평소 상한에 걸려 마지막 수단으로만 뽑음
-    const exclusionsFor = (group) => ({
-      hard: new Set([
-        ...computeWeekendExclusion(prevEntry, dow, date, group, data),
-        ...namesAtMonthlyCap(monthlyPicks[group], workingMembers[group], year, month, limited[group], 'max'),
-      ]),
-      soft: namesAtMonthlyCap(monthlyPicks[group], workingMembers[group], year, month, limited[group], 'soft'),
-    });
+    // 그룹별 제외 명단: hard = 절대 못 뽑음(주말 연속·최대 상한),
+    // tiers = 평소 상한 → 지난달 3회자 2회 허용 순으로, 앞 단계로 자리가 안 차면 뒤 단계 순서로 풀린다
+    const exclusionsFor = (group) => {
+      const capNames = (tier) => namesAtMonthlyCap(monthlyPicks[group], workingMembers[group], year, month, limited[group], tier);
+      return {
+        hard: new Set([...computeWeekendExclusion(prevEntry, dow, date, group, data), ...capNames('max')]),
+        tiers: [capNames('soft'), capNames('mid')],
+      };
+    };
     const exMgr = exclusionsFor('managers');
     const exFk = exclusionsFor('forklift');
     const exField = exclusionsFor('field');
 
-    const mgrResult = assignSingleSlot(workingMembers.managers, date, dow, exMgr.hard, exMgr.soft, owed.managers);
+    const mgrResult = assignSingleSlot(workingMembers.managers, date, dow, exMgr.hard, exMgr.tiers, owed.managers);
     entry.managers = mgrResult.picked;
     owed.managers = mgrResult.owedSet;
     if (mgrResult.shortfall) entry.warnings.push(`관리자 인원 부족 (${mgrResult.shortfall}명 미배정)`);
     stats.altTotal += mgrResult.altTotal;
     stats.altExceptions += mgrResult.altExceptions;
 
-    const fkResult = assignSingleSlot(workingMembers.forklift, date, dow, exFk.hard, exFk.soft, owed.forklift);
+    const fkResult = assignSingleSlot(workingMembers.forklift, date, dow, exFk.hard, exFk.tiers, owed.forklift);
     entry.forklift = fkResult.picked;
     owed.forklift = fkResult.owedSet;
     if (fkResult.shortfall) entry.warnings.push(`지게차 인원 부족 (${fkResult.shortfall}명 미배정)`);
@@ -840,7 +858,7 @@ function generateMonthSchedule(year, month, data, mode = currentMode) {
       const required = dow === 'sat' ? pool.requiredSat : pool.requiredSun;
       const label = pool.dept ? `현장(${pool.dept})` : '현장';
       const fieldResult = assignFieldDay(
-        poolMembers, date, dow, required, exField.hard, exField.soft, owed.field, label
+        poolMembers, date, dow, required, exField.hard, exField.tiers, owed.field, label
       );
       entry.fieldByDept[pool.key] = fieldResult.picked;
       owed.field = fieldResult.owedSet;
@@ -1008,6 +1026,9 @@ function renderSchedule(draft, data) {
           const c = (runTally[g].get(name) || 0) + 1;
           runTally[g].set(name, c);
           if (c >= MONTHLY_MAX_CAP) notes.push(`${name} 이번 달 ${c}번째 근무`);
+          else if (c >= LIMITED_MONTH_MAX_CAP && (draft.limited[g] || []).includes(name)) {
+            notes.push(`${name} 지난달 3회 근무 → 이번 달 ${c}번째 근무 (인원 부족)`);
+          }
         });
       });
     }
@@ -1550,9 +1571,16 @@ function onGenerate() {
   const groupLabel = { managers: '관리자', forklift: '지게차', field: '현장' };
   const maxed = findMaxedOut(computeMonthlyTallies(currentDraft, DATA));
   const maxedText = LIMIT_GROUPS.flatMap((g) => maxed[g].map((x) => `${x.name}(${groupLabel[g]} ${x.count}회)`)).join(', ');
-  const limitedText = LIMIT_GROUPS.flatMap((g) => currentDraft.limited[g].map((n) => `${n}(${groupLabel[g]})`)).join(', ');
+  const tallies = computeMonthlyTallies(currentDraft, DATA);
+  const limitedOnce = [];
+  const limitedTwice = [];
+  LIMIT_GROUPS.forEach((g) => currentDraft.limited[g].forEach((n) => {
+    const label = `${n}(${groupLabel[g]})`;
+    ((tallies[g].get(n) || 0) >= LIMITED_MONTH_MAX_CAP ? limitedTwice : limitedOnce).push(label);
+  }));
   const capMsg = (maxedText ? ` 인원이 모자라 월 ${MONTHLY_MAX_CAP}회 근무가 된 사람: ${maxedText} — 저장하면 다음 달엔 1회만 배정됩니다.` : '')
-    + (limitedText ? ` 지난달 ${MONTHLY_MAX_CAP}회 근무로 이번 달 1회만 배정한 사람: ${limitedText}.` : '');
+    + (limitedOnce.length ? ` 지난달 ${MONTHLY_MAX_CAP}회 근무로 이번 달 1회만 배정한 사람: ${limitedOnce.join(', ')}.` : '')
+    + (limitedTwice.length ? ` 지난달 ${MONTHLY_MAX_CAP}회 근무했지만 인원이 안 맞아 이번 달 2회 배정된 사람: ${limitedTwice.join(', ')}.` : '');
   const altMsg = altExceptions
     ? ` 요일 교대 예외 ${altExceptions}/${altTotal}건 (인원이 모자라 같은 요일을 연속 배정).`
     : '';
