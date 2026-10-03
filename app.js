@@ -26,6 +26,7 @@
  * scheduleLogCsv (선택) : ScheduleLog 탭(날짜 | 요일 | 그룹 | 이름)을 CSV로 게시한 URL.
  *   채우면 "최근 3개월 근무 횟수(신규 인원은 근무 가능했던 달 기준 평균)"로 공평하게 배정하고,
  *   비워두면 예전처럼 누적횟수 기준으로 동작한다. 확정 저장을 하면 이 탭에 근무 기록이 쌓인다.
+ *   "저장된 배정 보기" 버튼(이미 확정한 달을 다시 자동배정 없이 그대로 조회·출력)도 이 값이 있어야 쓸 수 있다.
  * appsScriptUrl : Apps Script를 웹앱으로 배포한 .../exec 주소
  * ============================================================ */
 const CONFIG = {
@@ -1152,6 +1153,91 @@ function generateMonthSchedule(year, month, data, mode = currentMode, prev = nul
   };
 }
 
+/**
+ * "저장된 배정 보기" — 이미 확정 저장돼 ScheduleLog에 쌓인 내용을 자동배정 없이 그대로 다시 그린다.
+ * 실제로 결정된 내용을 조회·엑셀·PDF 출력하기 위한 용도라서, generateMonthSchedule과 같은 모양의
+ * 배정표 객체를 돌려주되 fromLog: true 를 붙인다 — onViewSaved가 이걸 보고 "확정 저장" 버튼을
+ * 비활성화한다 (다시 누르면 ScheduleLog에 같은 기록이 중복으로 쌓이기 때문).
+ * 그 달에 기록이 아예 없는 날짜는 빈 칸으로 두고 경고 자리에 안내만 남긴다.
+ */
+function buildDraftFromLog(year, month, data, mode = currentMode) {
+  const ym = ymKey(year, month);
+  const byDate = new Map(); // iso -> { managers: [...], forklift: [...], field: [...] }
+  (data.shiftLog || []).forEach((r) => {
+    if (!r.date.startsWith(ym)) return;
+    if (!byDate.has(r.date)) byDate.set(r.date, { managers: [], forklift: [], field: [] });
+    byDate.get(r.date)[r.group].push(r.name);
+  });
+
+  const pools = getFieldPools(data, mode);
+  const scheduleWorkers = getScheduleWorkers(data.field.members);
+  const days = getWeekendDatesInMonth(year, month).map(({ date, dow }) => {
+    const iso = toISODate(date);
+    const isHoliday = data.holidays.has(iso);
+    const entry = {
+      date: iso,
+      dow,
+      isHoliday,
+      holidayLabel: isHoliday ? (data.holidays.get(iso) || '공휴일') : '',
+      managers: [],
+      forklift: [],
+      field: [],
+      fieldByDept: {},
+      warnings: [],
+    };
+    if (isHoliday) return entry;
+
+    const logged = byDate.get(iso);
+    entry.managers = logged ? logged.managers.slice() : [];
+    entry.forklift = logged ? logged.forklift.slice() : [];
+    pools.forEach((pool) => {
+      const fixedNames = scheduleWorkers.filter((m) => poolIncludes(pool, m)).map((m) => m.name);
+      const loggedNames = (logged ? logged.field : []).filter((n) => {
+        if (fixedNames.includes(n)) return false; // 고정근무자는 로그에 안 남지만 혹시 있어도 중복 방지
+        const member = data.field.members.find((m) => m.name === n);
+        return member && poolIncludes(pool, member);
+      });
+      entry.fieldByDept[pool.key] = [...fixedNames, ...loggedNames];
+    });
+    syncFlatField(entry, pools);
+    if (!logged) entry.warnings.push('이 날짜는 확정 저장된 기록이 없습니다.');
+    return entry;
+  });
+
+  const limitsThisMonth = (data.tieBreakHistory.monthLimits || {})[ym] || {};
+  const limited = {
+    managers: (limitsThisMonth.managers || []).filter((n) => data.managers.members.some((m) => m.name === n)),
+    forklift: (limitsThisMonth.forklift || []).filter((n) => data.forklift.members.some((m) => m.name === n)),
+    field: (limitsThisMonth.field || []).filter((n) => data.field.members.some((m) => m.name === n)),
+  };
+
+  return {
+    days,
+    owed: {
+      managers: new Set(data.tieBreakHistory.managers),
+      forklift: new Set(data.tieBreakHistory.forklift),
+      field: new Set(data.tieBreakHistory.field),
+    },
+    workingMembers: {
+      managers: cloneMembers(data.managers.members),
+      forklift: cloneMembers(data.forklift.members),
+      field: cloneMembers(data.field.members),
+    },
+    pools,
+    mode,
+    year,
+    month,
+    stats: { altTotal: 0, altExceptions: 0 },
+    groupRequired: {
+      managers: { ...(data.managers.required || DEFAULT_GROUP_REQUIRED) },
+      forklift: { ...(data.forklift.required || DEFAULT_GROUP_REQUIRED) },
+    },
+    groupCols: { managers: getGroupCols(data, 'managers'), forklift: getGroupCols(data, 'forklift') },
+    limited,
+    fromLog: true,
+  };
+}
+
 /* ============================================================
  * 화면 렌더링
  * ============================================================ */
@@ -1201,7 +1287,7 @@ function setStatus(msg, type) {
 function resetDraftUi(clearStatus = true) {
   currentDraft = null;
   document.getElementById('scheduleContainer').innerHTML =
-    '<p class="empty-hint">연도/월을 선택하고 "자동배정 생성"을 눌러주세요.</p>';
+    '<p class="empty-hint">연도/월을 선택하고 "자동배정 생성" 또는 "저장된 배정 보기"를 눌러주세요.</p>';
   document.getElementById('btnCommit').disabled = true;
   document.getElementById('btnExport').disabled = true;
   document.getElementById('btnHandout').disabled = true;
@@ -1461,6 +1547,8 @@ function onReassign() {
   const mode = currentDraft.mode;
   currentDraft = generateMonthSchedule(currentDraft.year, currentDraft.month, DATA, mode, currentDraft);
   renderSchedule(currentDraft, DATA);
+  // "저장된 배정 보기"에서 넘어온 경우 확정 저장을 꺼뒀는데, 다시 배정하면 정식 자동배정 결과라서 다시 켠다.
+  document.getElementById('btnCommit').disabled = false;
   setStatus(`[${getModeLabel(mode)}] 고정한 ${lockedBefore}칸은 그대로 두고 나머지를 다시 배정했습니다.${draftSummaryMessage(currentDraft)} 저장 전에 검토해주세요.`, 'success');
 }
 
@@ -1992,6 +2080,7 @@ async function reloadData() {
   setStatus('데이터를 불러오는 중입니다...', '');
   document.getElementById('btnReload').disabled = true;
   document.getElementById('btnGenerate').disabled = true;
+  document.getElementById('btnViewSaved').disabled = true;
   try {
     DATA = await loadData();
     renderRosterStatus(DATA);
@@ -2002,6 +2091,7 @@ async function reloadData() {
   } finally {
     document.getElementById('btnReload').disabled = false;
     document.getElementById('btnGenerate').disabled = false;
+    document.getElementById('btnViewSaved').disabled = false;
   }
   resetDraftUi(false);
 }
@@ -2040,6 +2130,29 @@ function onGenerate() {
   setStatus(`[${getModeLabel(currentMode)}] 배정표를 생성했습니다.${draftSummaryMessage(currentDraft)} 저장 전에 검토해주세요.`, 'success');
 }
 
+/** "저장된 배정 보기" — 이미 확정 저장된 달을 자동배정 없이 그대로 불러와 조회·엑셀·PDF 출력만 한다 */
+function onViewSaved() {
+  if (!DATA) return;
+  const year = Number(yearSelectEl.value);
+  const month = Number(monthSelectEl.value);
+  if (!DATA.shiftLog) {
+    setStatus('확정 기록(ScheduleLog)을 불러올 수 없어 조회할 수 없습니다. scheduleLogCsv 주소와 시트 게시 상태를 확인해주세요.', 'error');
+    return;
+  }
+  const ym = ymKey(year, month);
+  const hasAny = DATA.shiftLog.some((r) => r.date.startsWith(ym));
+  currentDraft = buildDraftFromLog(year, month, DATA, currentMode);
+  renderSchedule(currentDraft, DATA);
+  document.getElementById('btnCommit').disabled = true; // 이미 저장된 내용이라 다시 누르면 기록이 중복됩니다
+  document.getElementById('btnExport').disabled = false;
+  document.getElementById('btnHandout').disabled = false;
+  if (hasAny) {
+    setStatus(`[${getModeLabel(currentMode)}] ${year}년 ${month}월에 확정 저장된 배정표를 불러왔습니다. 이미 저장된 내용이라 "확정 저장"은 비활성화했습니다 — 수정이 필요하면 시트를 직접 고쳐주세요. 엑셀 다운로드·현장전달문서는 바로 쓸 수 있습니다.`, 'success');
+  } else {
+    setStatus(`[${getModeLabel(currentMode)}] ${year}년 ${month}월은 확정 저장된 기록이 없어 빈 배정표를 보여드립니다. 새로 만들려면 "자동배정 생성"을 눌러주세요.`, '');
+  }
+}
+
 function updateModeButtons() {
   document.querySelectorAll('.mode-btn').forEach((btn) => {
     const active = btn.dataset.mode === currentMode;
@@ -2071,6 +2184,7 @@ function initModeSwitch() {
 
 document.getElementById('btnReload').addEventListener('click', reloadData);
 document.getElementById('btnGenerate').addEventListener('click', onGenerate);
+document.getElementById('btnViewSaved').addEventListener('click', onViewSaved);
 document.getElementById('btnReassign').addEventListener('click', onReassign);
 document.getElementById('btnLockAll').addEventListener('click', () => setAllLocks(true));
 document.getElementById('btnUnlockAll').addEventListener('click', () => setAllLocks(false));
